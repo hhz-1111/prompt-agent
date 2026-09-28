@@ -25,8 +25,8 @@ shots = ["scenedetect>=0.6.4"]
 vision = ["ultralytics>=8.3"]
 dev = ["pytest>=8.0"]
 
-[tool.setuptools]
-packages = ["engine", "engine.core", "engine.app"]
+[tool.setuptools.packages.find]
+include = ["engine*"]
 
 [tool.pytest.ini_options]
 testpaths = ["engine/tests"]
