@@ -359,8 +359,11 @@ def _register_routes(
 
         doc = assembler.assemble(project.ir, library)
         report = gates.run_gates(project.ir, doc, library)
+
+        warnings = list(doc.warnings)
+        warnings.extend(_blocking_hints(project.ir))
         return {
-            "document": doc.to_dict(),
+            "document": {**doc.to_dict(), "warnings": warnings},
             "gates": report.to_dict(),
             "compression": [e.to_dict() for e in doc.compression],
             "split_plan": [seg.to_dict() for seg in doc.plan],
@@ -434,6 +437,31 @@ def _prov(project: Project) -> dict[str, Any]:
         except (KeyError, ValueError, TypeError):
             continue
     return out
+
+
+def _blocking_hints(ir: dict[str, Any]) -> list[str]:
+    """把"用户必须先补什么"直接列出来，而不是让用户去闸门列表里找。
+
+    这些不是错误，是**待办**：反推不出人物时，交付物会缺"人物一致性"整句，
+    而那句话决定"像不像原片"。只在 G13 里出现一条告警太容易被忽略。
+    """
+    hints: list[str] = []
+    if not ir.get("locked", {}).get("B2_person"):
+        hints.append(
+            "未反推出人物清单：请补充角色名并绑定多视图素材，"
+            "否则交付物缺少「人物一致性」段落 —— 这决定跨镜头会不会漂移。"
+        )
+    if not ir.get("locked", {}).get("B6_audio"):
+        hints.append(
+            "未反推出音色绑定：每个有台词的角色都需要一条音色参考，"
+            "否则口型与音色对不上（闸门 G6 会阻断）。"
+        )
+    beats = ir.get("creative", {}).get("C2_beats", [])
+    if beats and not any((b.get("dialogue") or {}).get("line") for b in beats):
+        hints.append(
+            "台词为空：请粘贴你自己的台词。台词是你的创作，Agent 不代写（红线 3）。"
+        )
+    return hints
 
 
 def _run_inference(store: ProjectStore, settings: Settings, project_id: str) -> None:
