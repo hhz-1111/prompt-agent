@@ -271,6 +271,49 @@ class TestCvLayer:
         assert not _camera_agrees("手持", "push_in")
 
 
+class TestVideoLimits:
+    """PRD F1.1：≤3min / ≤500MB。超限要**早失败**，不是跑完再报错。"""
+
+    def test_over_duration_is_rejected_before_analysis(self):
+        inferencer = _inferencer(probe=_StubProbe(_info(240.0)))  # 4 分钟
+        with pytest.raises(ValueError, match="超过 3 分钟上限"):
+            inferencer.infer("fake.mp4")
+
+    def test_zero_duration_is_rejected(self):
+        inferencer = _inferencer(probe=_StubProbe(_info(0.0)))
+        with pytest.raises(ValueError, match="时长为 0"):
+            inferencer.infer("fake.mp4")
+
+    def test_three_minutes_is_allowed(self):
+        inferencer = _inferencer(probe=_StubProbe(_info(180.0)))
+        report = inferencer.infer("fake.mp4")
+        assert report.video.duration_sec == 180.0
+
+
+class TestHookGateHonesty:
+    """G11 在无基准时不能假称"已校验保留"。"""
+
+    def test_no_baseline_says_so(self):
+        from engine.app.pipeline.infer import Inferencer
+        from engine.core.gates import g11_hook_preserved
+
+        ir = Inferencer.to_ir(_inferencer().infer("fake.mp4"))
+        result = g11_hook_preserved(ir, None)
+        assert result.status == "ok"
+        assert "无原片基准可比对类型" in result.detail
+
+    def test_with_baseline_compares_counts(self):
+        from engine.app.pipeline.infer import Inferencer
+        from engine.core.gates import g11_hook_preserved
+
+        baseline = Inferencer.to_ir(_inferencer().infer("fake.mp4"))
+        modified = Inferencer.to_ir(_inferencer().infer("fake.mp4"))
+        for beat in modified["creative"]["C2_beats"]:
+            beat["beat_role"] = "demo"
+        result = g11_hook_preserved(modified, baseline)
+        assert result.blocking
+
+
 class TestShotBoundaryBuilding:
     """PySceneDetect 切点 → 连续镜头区间。"""
 

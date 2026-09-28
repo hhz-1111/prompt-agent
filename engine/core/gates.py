@@ -458,7 +458,12 @@ def g11_hook_preserved(
     ir: Mapping[str, Any],
     baseline: Mapping[str, Any] | None = None,
 ) -> GateResult:
-    """G11 钩子类型保留。"""
+    """G11 钩子类型保留。
+
+    **基准缺失时的语义要说实话**：首次反推没有"原片基准"可比，
+    这里只能确认"存在钩子节拍"，无法证明"与原片同类"。
+    结论里会写明这一点，不假称已校验保留。
+    """
     from .types import BeatRole
 
     hooks = [
@@ -474,18 +479,27 @@ def g11_hook_preserved(
                 "钩子丢了，爆款结构就没了。"
             ),
         )
-    if baseline is not None:
-        base_hooks = [
-            beat for beat in baseline.get("creative", {}).get("C2_beats", [])
-            if str(beat.get("beat_role") or "") == BeatRole.HOOK.value
-        ]
-        if base_hooks and len(hooks) < len(base_hooks):
-            return GateResult(
-                "G11", "钩子保留", BLOCK,
-                f"钩子数量减少：{len(base_hooks)} → {len(hooks)}",
-                suggestion="逐条核对钩子节拍是否被合并或删除。",
-            )
-    return GateResult("G11", "钩子保留", OK, f"{len(hooks)} 个 hook 节拍")
+    if baseline is None:
+        return GateResult(
+            "G11", "钩子保留", OK,
+            f"存在 {len(hooks)} 个钩子节拍（首次反推，无原片基准可比对类型）",
+            suggestion="改写过文案后，本项会与反推基准逐条比对钩子类型是否同类。",
+        )
+
+    base_hooks = [
+        beat for beat in baseline.get("creative", {}).get("C2_beats", [])
+        if str(beat.get("beat_role") or "") == BeatRole.HOOK.value
+    ]
+    if base_hooks and len(hooks) < len(base_hooks):
+        return GateResult(
+            "G11", "钩子保留", BLOCK,
+            f"钩子数量减少：{len(base_hooks)} → {len(hooks)}",
+            suggestion="逐条核对钩子节拍是否被合并或删除。",
+        )
+    return GateResult(
+        "G11", "钩子保留", OK,
+        f"{len(hooks)} 个钩子节拍，与原片同类（基准 {len(base_hooks)} 个）",
+    )
 
 
 def g12_ref_roles(doc: PromptDocument, ir: Mapping[str, Any]) -> GateResult:

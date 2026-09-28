@@ -51,6 +51,14 @@ from ..providers.ffmpeg_media import FFmpegMedia, FrameMean, parse_frame_means
 
 ProgressFn = Callable[[str, float], None]
 
+MAX_VIDEO_SECONDS = 180.0
+"""素材时长上限（PRD F1.1：≤3min）。
+
+为什么在反推阶段硬拦：超长视频不光是慢 —— 它意味着**用户拿错素材了**。
+爆款复刻的目标素材通常 7~30 秒；3 分钟以上的东西多半是成片而非可复刻的爆款。
+早失败比跑完 5 分钟再报错好。
+"""
+
 # 运镜：CV 结论 → 框架 rig 白名单
 RIG_BY_MOTION: dict[str, str] = {
     "fixed": "固定机位全程不变",
@@ -112,6 +120,13 @@ class Inferencer:
         # ---- 步骤 1：技术解析 ----
         progress("技术解析", 0.05)
         info = self.probe.probe(video_path)
+        if info.duration_sec > MAX_VIDEO_SECONDS:
+            raise ValueError(
+                f"视频 {info.duration_sec:.1f} 秒超过 {MAX_VIDEO_SECONDS / 60:.0f} 分钟上限"
+                f"（PRD F1.1）。爆款复刻的素材通常很短，超长视频请先裁剪。"
+            )
+        if info.duration_sec <= 0:
+            raise ValueError("ffprobe 读到的时长为 0，文件可能损坏或不是有效视频")
 
         # ---- 步骤 2：四路信号 ----
         progress("镜头切分", 0.15)
