@@ -583,13 +583,24 @@ def _render_beats(ir: Mapping[str, Any]) -> list[str]:
         else:
             prefix = f"镜头{shot_id}："
 
-        # 技术头 / 动作 / 表情 / 情绪，逐段成句，避免标点拼接出错
-        segments = [head, blocking, expression]
-        if emotion:
-            segments.append(f"语气{emotion}")
+        # 技术头 / 动作 / 表情 / 情绪，逐段成句，避免标点拼接出错。
+        # UNKNOWN 不写进正文：把"没反推出来"写成 unknown 是往提示词里灌噪声。
+        segments = [
+            _text_or_empty(head), _text_or_empty(blocking),
+            _text_or_empty(expression),
+        ]
+        if _text_or_empty(emotion):
+            segments.append(f"语气{_text_or_empty(emotion)}")
         body = "，".join(s.rstrip("。，") for s in segments if s)
-        lines.append(f"{prefix}{body or framing or camera}。")
+        if not body:
+            # 这个镜头什么都没反推出来：跳过，不产出 "镜头N：unknown。" 这种垃圾行
+            continue
+        lines.append(f"{prefix}{body}。")
     return lines
+
+
+def _text_or_empty(value: str) -> str:
+    return "" if value in UNKNOWN or value is None else str(value).strip()
 
 
 def _fmt_sec(value: float) -> str:
@@ -611,9 +622,10 @@ def _render_dialogue(ir: Mapping[str, Any]) -> list[str]:
             head += f"（{speaker}"
             head += f"，语气{tone}）" if tone else "）"
         lines.append(f"{head}：{ensure_quoted(line)}")
-    if lines:
-        lines.append(LIPSYNC_SENTENCE)
-    return lines
+    if not lines:
+        # 没有台词就不要输出口型段落 —— 空段落会被误读成"要求保持口型同步"
+        return []
+    return [DIALOGUE_PREFIX] + lines + [LIPSYNC_SENTENCE]
 
 
 def _render_forbidden(ir: Mapping[str, Any]) -> list[str]:
@@ -935,7 +947,7 @@ def assemble(
     if dialogue:
         doc.sections.append(PromptSection(
             title=fw.SEC_DIALOGUE,
-            lines=[DIALOGUE_PREFIX] + dialogue,
+            lines=dialogue,
             sources=["creative.C2_beats[].dialogue"],
         ))
 

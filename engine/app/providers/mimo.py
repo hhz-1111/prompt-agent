@@ -17,15 +17,15 @@ import base64
 import json
 import mimetypes
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.request
-import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from engine.core.contracts import TranscriptSegment
-from engine.core.types import ConfidenceBasis, Span
+from engine.core.types import ConfidenceBasis, Span, compute_confidence
 
 from ..config import Settings
 
@@ -130,22 +130,41 @@ class MimoClient:
         model: str | None = None,
         language: str = "zh",
     ) -> list[TranscriptSegment]:
-        """语音识别，返回词/句级时间戳片段。"""
+        """语音识别，返回句级时间戳片段。
+
+        **MiMo 的 ASR 不是 OpenAI 的 ``/audio/transcriptions``**，
+        而是走 ``/v1/chat/completions``，音频以 ``input_audio`` data URL 传入。
+        只支持 mp3 与 wav 两种格式。
+        """
         target = model or self.settings.model_asr
         path = Path(audio_path)
         if not path.exists():
             raise MimoError(f"音频文件不存在：{audio_path}")
 
-        fields = {"model": target, "language": language}
-        body, content_type = _multipart(fields, "file", path)
-        raw = self._post(
-            "/audio/transcriptions",
-            None,
-            raw_body=body,
-            content_type=content_type,
-            model=target,
-        )
-        return _segments_from_asr(raw)
+        audio_format, mime = _audio_format(path)
+        if audio_format is None:
+            raise MimoError(
+                f"ASR 只支持 mp3 / wav，收到 {path.suffix}；"
+                "请先用 ffmpeg 转成 wav（-ac 1 -ar 16000）"
+            )
+
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        payload = {
+            "model": target,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": f"data:{mime};base64,{encoded}",
+                        "format": audio_format,
+                    },
+                }],
+            }],
+            "asr_options": {"language": language},
+        }
+        raw = self._post("/chat/completions", payload, model=target)
+        return _segments_from_asr(raw, expected_span_ms=_probe_duration_ms(path))
 
     # ------------------------------------------------------------------
     # 内部
@@ -256,34 +275,46 @@ def _data_url(path: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-def _multipart(
-    fields: Mapping[str, str],
-    file_field: str,
-    file_path: Path,
-) -> tuple[bytes, str]:
-    """极简 multipart/form-data 编码。只为 ASR 上传服务，不做通用实现。"""
-    boundary = f"----mod{uuid.uuid4().hex}"
-    chunks: list[bytes] = []
-    for name, value in fields.items():
-        chunks.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
-            f"{value}\r\n".encode("utf-8")
+_AUDIO_FORMATS: Mapping[str, tuple[str, str]] = {
+    ".wav": ("wav", "audio/wav"),
+    ".mp3": ("mp3", "audio/mpeg"),
+    ".m4a": ("mp3", "audio/mpeg"),  # 需先转换
+}
+
+
+def _audio_format(path: Path) -> tuple[str | None, str]:
+    entry = _AUDIO_FORMATS.get(path.suffix.lower())
+    return entry if entry else (None, "")
+
+
+def _probe_duration_ms(path: Path) -> int:
+    """用 ffprobe 取音频真实时长（毫秒）。拿不到就返回 0，由上层降级。"""
+    try:
+        process = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, check=False,
         )
-    mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-    chunks.append(
-        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
-        f'filename="{file_path.name}"\r\nContent-Type: {mime}\r\n\r\n'.encode("utf-8")
-    )
-    chunks.append(file_path.read_bytes())
-    chunks.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
-    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+        return int(float(process.stdout.strip()) * 1000)
+    except (ValueError, OSError):
+        return 0
 
 
-def _segments_from_asr(raw: Mapping[str, Any]) -> list[TranscriptSegment]:
+def _segments_from_asr(
+    raw: Mapping[str, Any],
+    *,
+    expected_span_ms: int = 0,
+) -> list[TranscriptSegment]:
     """把 ASR 响应统一成 TranscriptSegment。
 
-    不同实现返回的字段名不一样，这里做一次兼容收敛，
-    但**绝不编造时间戳**：拿不到就退化成整段（confidence 同步下调）。
+    MiMo 的 ASR 返回的是识别文本，**不保证带词级时间戳**。
+    这里如实处理：
+
+    - 有 ``segments`` → 用它的时间戳；
+    - 只有整段文本 + 已知音频时长 → 给出整段区间，并按"只有时间码"计置信度；
+    - 只有文本、时长未知 → 时间码留 0 并降置信度，让上层决定是否标黄。
+
+    **绝不编造词级时间戳** —— 那会让下游的对齐与时长校验全建立在假数据上。
     """
     segments = raw.get("segments")
     if isinstance(segments, list) and segments:
@@ -299,23 +330,49 @@ def _segments_from_asr(raw: Mapping[str, Any]) -> list[TranscriptSegment]:
             out.append(TranscriptSegment(
                 text=text,
                 span=Span(int(start * 1000), int(end * 1000)),
-                confidence=0.85,
+                confidence=compute_confidence(
+                    ConfidenceBasis.ASR_CLEAR,
+                    consistency="single",
+                    evidence="timecode_only",
+                ),
+                has_timestamps=True,
             ))
         if out:
             return out
 
     text = str(raw.get("text") or "").strip()
     if not text:
+        text = _text_from_choices(raw)
+    if not text:
         return []
-    # 无时间戳：明确标注为低置信整段，让上层决策，而不是假装有词级对齐
+
+    # 以下两种都是**没有词级时间戳**的情形。
+    # 区间只是"音频总时长"推导的，必须标 has_timestamps=False，
+    # 否则下游会拿它当对齐依据，把整段台词复制到每个重叠镜头。
+    if expected_span_ms > 0:
+        return [TranscriptSegment(
+            text=text,
+            span=Span(0, expected_span_ms),
+            confidence=compute_confidence(
+                ConfidenceBasis.ASR_CLEAR,
+                consistency="single",
+                evidence="timecode_only",
+            ),
+            has_timestamps=False,
+        )]
     return [TranscriptSegment(
         text=text,
         span=Span(0, 0),
-        confidence=0.55,
+        confidence=compute_confidence(
+            ConfidenceBasis.ASR_CLEAR, consistency="single", evidence="none"
+        ),
+        has_timestamps=False,
     )]
 
 
-def confidence_for(basis: ConfidenceBasis) -> float:
-    from engine.core.types import CONFIDENCE_BASE
-
-    return CONFIDENCE_BASE[basis]
+def _text_from_choices(raw: Mapping[str, Any]) -> str:
+    """ASR 走 chat/completions，识别结果在 choices[0].message.content。"""
+    try:
+        return str(raw["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        return ""

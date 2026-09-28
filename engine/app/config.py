@@ -54,10 +54,10 @@ class Settings:
 
     # 抽帧密度：PRD 要求"支持高密度抽帧（时序）"
     frames_per_shot: int = 3
-    # 切点判定阈值：64x64 缩放后逐帧 RGB 均值的归一化欧氏距离。
-    # 实测校准：硬切约 0.15~0.35；同场景内的轻微变化 <0.05。
-    # 调低会更敏感（可能把快速摇镜误判成切镜），调高会漏切。
-    scene_threshold: float = 0.12
+    # 切点判定阈值：64x64 缩放后逐帧色差（BT.601 加权、归一化）。
+    # 实测校准：硬切 0.40~0.50；同场景内的明显色变约 0.15；轻微变化 <0.05。
+    # 调低会更敏感（快速摇镜可能被误判成切镜），调高会漏切。
+    scene_threshold: float = 0.10
 
     @property
     def has_llm(self) -> bool:
@@ -83,7 +83,7 @@ class Settings:
             request_timeout_sec=float(pick("REQUEST_TIMEOUT_SEC", "180")),
             max_retries=int(pick("MAX_RETRIES", "2")),
             frames_per_shot=int(pick("FRAMES_PER_SHOT", "3")),
-            scene_threshold=float(pick("SCENE_THRESHOLD", "0.12")),
+            scene_threshold=float(pick("SCENE_THRESHOLD", "0.10")),
         )
 
     def capability_report(self) -> dict[str, object]:

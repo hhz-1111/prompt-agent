@@ -224,9 +224,16 @@ class FrameMean:
         return 0.299 * self.mean[0] + 0.587 * self.mean[1] + 0.114 * self.mean[2]
 
     def distance(self, other: "FrameMean") -> float:
-        """归一化 RGB 欧氏距离，0~1。硬切通常 >0.3。"""
-        r = sum((a - b) ** 2 for a, b in zip(self.mean, other.mean)) ** 0.5
-        return r / 441.67  # sqrt(3 × 255²)
+        """人眼感知加权的归一化色差（BT.601 亮度权重）。
+
+        为什么加权：等权欧氏距离会低估"暖棕→深灰"这类变化
+        （实测仅 0.09，低于阈值而漏切），却高估蓝色通道的微小抖动。
+        按 0.299/0.587/0.114 加权后更贴近人眼判断，
+        归一化分母是加权后的最大可能距离。
+        """
+        weights = (0.299, 0.587, 0.114)
+        total = sum(w * (a - b) ** 2 for w, a, b in zip(weights, self.mean, other.mean))
+        return (total ** 0.5) / 139.14  # sqrt(0.299²+0.587²+0.114²) × 255 的近似归一
 
 
 _MEAN_RE = re.compile(r"mean:\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]")

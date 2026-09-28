@@ -191,9 +191,14 @@ def build_positions(
     provenance: Mapping[str, Provenance] | None = None,
 ) -> PositionTable:
     """遍历 IR 叶子，逐个贴上类别、颜色、门禁与溯源。"""
+    from .contracts import NON_POSITION_KEYS
+
     prov = provenance or {}
     table = PositionTable()
     for path, value in fw.flatten(ir):
+        # 版本标记与 ASR 原始产物不是"位置"，不该出现在标注面板里
+        if path.split(".", 1)[0].split("[", 1)[0] in NON_POSITION_KEYS:
+            continue
         spec = fw.spec_for(path)
         if spec is None:
             # 契约外的字段：不给颜色，但在表里留痕便于发现契约漂移

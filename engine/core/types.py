@@ -227,28 +227,71 @@ class Span:
 
 
 class ConfidenceBasis(StrEnum):
-    """置信度基础分来源（MULTIMODAL §4.2）。"""
+    """置信度基础分来源（MULTIMODAL §4.2 权威表）。"""
 
-    FFMPEG = "ffmpeg"            # 1.00 唯一可信来源
-    CV = "cv"                    # 0.90 确定性算法
-    ASR = "asr"                  # 0.85 词级时间戳
-    VLM_CROSSED = "vlm_crossed"  # 0.75 模型判断且与 CV 一致
-    VLM_ALONE = "vlm_alone"      # 0.55 模型单独判断
-    INFERRED = "inferred"        # 0.40 归纳推断
+    FFMPEG = "ffmpeg"                  # 元数据 / ffprobe / 音频信号分析
+    CV = "cv"                          # CV 计算（光流、检测框、占比）
+    ASR_CLEAR = "asr_clear"            # ASR（清晰语音）
+    ASR_NOISY = "asr_noisy"            # ASR（嘈杂/多人重叠）
+    VLM_CROSSED = "vlm_crossed"        # 多模态模型 + CV 一致
+    VLM_ALONE = "vlm_alone"            # 多模态模型单独判断
+    VLM_CONFLICT = "vlm_conflict"      # 多模态模型 + CV 冲突
+    INFERRED = "inferred"              # 结构化推断（由以上推导，再 ×0.85）
 
 
 CONFIDENCE_BASE: Mapping[ConfidenceBasis, float] = {
     ConfidenceBasis.FFMPEG: 1.00,
-    ConfidenceBasis.CV: 0.90,
-    ConfidenceBasis.ASR: 0.85,
-    ConfidenceBasis.VLM_CROSSED: 0.75,
-    ConfidenceBasis.VLM_ALONE: 0.55,
-    ConfidenceBasis.INFERRED: 0.40,
+    ConfidenceBasis.CV: 0.95,
+    ConfidenceBasis.ASR_CLEAR: 0.90,
+    ConfidenceBasis.ASR_NOISY: 0.65,
+    ConfidenceBasis.VLM_CROSSED: 0.90,
+    ConfidenceBasis.VLM_ALONE: 0.70,
+    ConfidenceBasis.VLM_CONFLICT: 0.60,
+    ConfidenceBasis.INFERRED: 0.85,  # 实际算法：由来源基础分再乘 0.85
 }
 
-# 置信度分级阈值（PRD §6.1.4）。**原则：低置信度宁可留空让用户填，也不猜。**
-CONFIDENCE_ACCEPT = 0.70   # ≥0.70 直接采用
-CONFIDENCE_REVIEW = 0.50   # 0.50~0.70 标黄提示确认；<0.50 留空
+STRUCTURED_INFERENCE_FACTOR = 0.85
+"""结构化推断的额外折扣（MULTIMODAL §4.2 末行）。"""
+
+CONSISTENCY_COEFFICIENT: Mapping[str, float] = {
+    "agree": 1.00,     # 两个独立来源一致
+    "single": 0.85,    # 只有一个来源
+    "conflict": 0.70,  # 两个来源冲突
+}
+
+EVIDENCE_COEFFICIENT: Mapping[str, float] = {
+    "timecode_and_frame": 1.00,  # 有明确时间码 + 画面区域证据
+    "timecode_only": 0.90,       # 只有时间码
+    "none": 0.70,                # 无证据（纯推断）
+}
+
+# 置信度分级处置（MULTIMODAL §4.3 —— 注意与 PRD §6.1.4 的分档口径不同，
+# 这里以更细的 MULTIMODAL 表为准，PRD 的 0.70/0.50 是两个分界点）
+CONFIDENCE_CERTAIN = 0.85   # ≥0.85 确定：直接采用，不打扰用户
+CONFIDENCE_ACCEPT = 0.70    # 0.70~0.85 高：直接采用
+CONFIDENCE_REVIEW = 0.50    # 0.50~0.70 中：标黄提示确认；<0.50 低：不填
+
+
+def compute_confidence(
+    basis: ConfidenceBasis,
+    *,
+    consistency: str = "single",
+    evidence: str = "timecode_only",
+    is_structured_inference: bool = False,
+) -> float:
+    """置信度 = 基础分（来源类型）× 一致性系数 × 证据完整度。
+
+    ``is_structured_inference`` 为真时再乘 0.85（由其它维度推导出来的值）。
+    """
+    base = CONFIDENCE_BASE[basis]
+    value = (
+        base
+        * CONSISTENCY_COEFFICIENT.get(consistency, 0.85)
+        * EVIDENCE_COEFFICIENT.get(evidence, 0.90)
+    )
+    if is_structured_inference:
+        value *= STRUCTURED_INFERENCE_FACTOR
+    return round(min(1.0, max(0.0, value)), 4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,7 +306,9 @@ class Provenance:
 
     @property
     def disposition(self) -> str:
-        """分级处置：accept / review / blank。"""
+        """分级处置（MULTIMODAL §4.3）：certain / accept / review / blank。"""
+        if self.confidence >= CONFIDENCE_CERTAIN:
+            return "certain"
         if self.confidence >= CONFIDENCE_ACCEPT:
             return "accept"
         if self.confidence >= CONFIDENCE_REVIEW:

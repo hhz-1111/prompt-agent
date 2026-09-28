@@ -30,6 +30,23 @@ from .types import (
 # ==========================================================================
 # L0 信号层
 # ==========================================================================
+# ==========================================================================
+# 非位置字段
+# ==========================================================================
+NON_POSITION_KEYS: frozenset[str] = frozenset({
+    "framework_version",
+    "transcript",
+})
+"""IR 顶层里**不是可编辑位置**的键。
+
+- ``framework_version``：契约版本标记，只读元数据；
+- ``transcript``：ASR 原始产物，属于证据而非提示词内容。
+
+位置表、字数统计、闸门都要跳过它们 —— 否则用户会在"位置标注"里
+看到一个既不可编辑、也不是内容版本的字段，纯噪声。
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class VideoInfo:
     """ffprobe 的产物。**真实时长唯一可信来源**（PRD §6.1.6 致命级维度）。"""
@@ -266,12 +283,23 @@ class PlaceholderRef:
 
 @dataclass(frozen=True, slots=True)
 class TranscriptSegment:
-    """ASR 词级时间戳片段。"""
+    """ASR 词级时间戳片段。
+
+    ``has_timestamps`` 必须如实标注，这是**区分"知道"与"估的"** 的开关：
+
+    - ``True``：时间戳来自 ASR 的词/句对齐，可以按重叠把台词分配到镜头；
+    - ``False``：区间只是"音频总时长"推导出来的，只能说明"这段时间在说话"，
+      不能拿来当对齐依据。
+
+    少了这个标记，整段文本会因为"有区间"而被当成精确时间戳，
+    结果同一句台词被复制到所有重叠镜头 —— 实测踩过这个坑。
+    """
 
     text: str
     span: Span
     speaker: str = ""
     confidence: float = 0.85
+    has_timestamps: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -279,6 +307,7 @@ class TranscriptSegment:
             "span": self.span.to_dict(),
             "speaker": self.speaker,
             "confidence": round(self.confidence, 3),
+            "has_timestamps": self.has_timestamps,
         }
 
 
