@@ -99,31 +99,45 @@ cd web && npm install && npm run build && cd ..
 
 ### 实测基线（24 条真实爆款视频）
 
-| 指标 | 结果 |
-|---|---|
-| 反推成功率 | 24/24 |
-| 闸门可交付率 | 19/24（5 条被 G8 内容密度阻断） |
-| ASR 命中率 | 100% |
-| 结构归纳（logline）产出率 | 92% |
-| 平均单条耗时 | 约 42 秒 |
-| 平均时长 / 镜头数 | 12.2 秒 / **2.17 个** |
-| 镜头模式分布 | multi_shot 10 / one_take 10 / same_angle 4 |
-| 平均交付字数 | 831 字（压缩后） |
-| 常态告警 | G7 字数、G13 必写维度 |
+三次迭代的对比 —— 每一步提升都是靠**批量体检测出来的**，不是靠感觉：
+
+| 指标 | 自研切分 | +PySceneDetect | **+YOLO 人体检测** |
+|---|---|---|---|
+| 反推成功率 | 24/24 | 24/24 | **24/24** |
+| 闸门可交付率 | 24/24 | 19/24 | 19/24 |
+| **G13 必写维度告警** | 24 条 | 24 条 | **14 条** ↓10 |
+| logline 产出率 | 100% | 92% | **100%** |
+| **CV 缺口** | 3 项 | 3 项 | **0 项** |
+| 平均镜头数 | 1.21 | 2.17 | 2.17 |
+| 平均单条耗时 | 25s | 42s | 35s |
+| 平均交付字数 | 775 | 831 | 898 |
+
+**YOLO 带来的实际变化**（肉眼可验证）：
+
+| 视频 | CV 判定 | 是否与肉眼一致 |
+|---|---|---|
+| 菜市场采访-苏 | 近景（人体高度占 0.92）、1 人、居中 x≈0.50 | ✅ 单人近景口播 |
+| 爆款视频AI复刻刘畊宏 | 5 镜景别有变化（中近景/近景/中景）、每镜 2 人、左≈0.32 右≈0.70 | ✅ 双人左右对话 |
+| IP户外教学 | 6 镜均近景、2 人、左≈0.26 右≈0.73 | ✅ 双人教学 |
+
+跨镜头站位高度一致（左侧稳定在 0.26~0.32，右侧在 0.70~0.73），
+这正是 PRD 要的"站位 ≥95%"该有的表现 —— 几何量测本来就该这么稳。
+
+**G13 从 24 条告警降到 14 条**：景别、站位、人物一致性这几项由 CV 确定性
+算出后，必写维度立刻补齐，两条视频已经做到 8/8 全覆盖。
 
 三条读得出来的结论：
 
 - **镜头切分换成 PySceneDetect 后，检出能力显著提升**：
   平均镜头数从 1.21 升到 2.17，正确判为多镜头的从 3 条升到 10 条。
   `爆款视频AI复刻刘畊宏`（9 秒 5 个切镜）从"检出 0"变成"检出 5"。
-  代价是耗时从 25 秒升到 42 秒 —— 镜头多了，视觉模型调用就多，这是合理的交换。
 - **G8 阻断的 5 条是真问题，不是误报**：它们是快切混剪
   （如 9 秒 5 个镜头 = 每镜 1.8 秒），塞进一条提示词模型必然丢细节。
   闸门给的是两个方向的方案：延长目标时长拆条，或合并节拍。
-- **G7 与 G13 是常态告警，不是异常**。它们反映的是"这些爆款视频本身
-  信息密度就高"，需要用户自己精简创作区；把它当阻断会挡住所有合法提示词。
+- **G7 是常态告警，不是异常**。它反映的是"这些爆款视频本身信息密度就高"，
+  需要用户自己精简创作区；把它当阻断会挡住所有合法提示词。
 
-### 早期发现的三个真 bug（都靠批量体检抓出来）
+### 靠批量体检抓出来的四个真 bug
 
 单测发现不了这类问题 —— 它们只在真实素材的真实分布里才暴露：
 
@@ -136,6 +150,9 @@ cd web && npm install && npm run build && cd ..
 3. **末尾碎片镜头让整条反推失败**：一条视频切出 180ms 的尾巴，
    抽帧时 `-ss` 落到实际帧位置之外，ffmpeg 报错并中断全流程。
    修法：碎片并入前一镜；单帧抽取失败不拖垮整条链路。
+4. **单人居中的站位被丢掉**：站位归纳只认"左/右"，而单人成片
+   最常见的是"始终居中"。按 PRD 站位是致命级维度，
+   不能因为"不左不右"就不写。
 
 ---
 
@@ -146,11 +163,16 @@ cd web && npm install && npm run build && cd ..
 | 依赖 | 用途 | 为什么用它而不是自己写 |
 |---|---|---|
 | **PySceneDetect** | 镜头切分 | 见下方对比，自研实现在低对比度切镜上会漏检 |
+| **ultralytics (YOLO)** | 人体检测 → 景别/站位/人数 | 让 PRD 的"CV 强判断"真正落地，置信度从 VLM(0.70) 升到 CV(0.95) |
 | ffmpeg / ffprobe | 技术解析、抽帧、抽音轨 | 时长唯一可信来源；抽帧不必自己解码 |
 | MiMo API | 视觉理解 / 语义归纳 / ASR | 自带的 ASR 与视觉能力省掉两套服务 |
 
 领域内核（`engine/core`）**不依赖任何第三方** —— 这条纪律让核心逻辑
 能秒级测完、能在没网没 Key 的机器上验证。
+
+两个可选依赖都做了**能力探测与降级**：
+没装 PySceneDetect 就退回内置的 ffmpeg 均值切分；没装 ultralytics 就
+退回"模型单独判断"。两条路都能跑通，能力差异会体现在 `/api/health` 里。
 
 ### 镜头切分：从自研换成 PySceneDetect
 
@@ -188,17 +210,38 @@ PySceneDetect 的核心是**逐像素 HSV 三通道加权差分**
 
 ### 看过但没采用
 
-| 项目 | 它做了什么 | 为什么不直接抄 |
-|---|---|---|
-| [viral-video-replicator](https://github.com/dingtom336-gif/viral-video-replicator) | 目标几乎相同：FFmpeg 抽帧 → 视觉模型 → Seedance 提示词 | 是 Claude Code 的 SKILL.md（提示词工程，无代码架构）。它的**降级链**设计值得吸收：每个失败点都写明"用户还能拿到什么、质量损失多少" |
-| [video-to-prompt](https://github.com/imooooc/video-to-prompt) | 浏览器版视频反推，支持 Seedance | 纯前端 + Gemini，单条提示词输出，没有框架契约与位置标注 |
-| [promptlab](https://github.com/gracech0322-cmd/promptlab-image-video-to-prompt) | Chrome 扩展，Seedance 2.0 风格提示词 | 抽帧采样策略（按视频时长决定帧数、采样 0%~95% 避开黑帧）可以借鉴；它明确不做镜头切分 |
-| 各类 seedance-prompt-guide | Seedance 提示词写法指南 | 是文档不是代码，且与你的 `TEMPLATES`/`PHRASES` 高度重叠，我们自己的规范更完整 |
+按 star 数从高到低，分层看过：
+
+**高星基础库（万星级）—— 领域不匹配，用不上**
+
+| 项目 | 星数 | 它是什么 | 为什么不采用 |
+|---|---|---|---|
+| [ultralytics](https://github.com/ultralytics/ultralytics) | 62k | YOLO 目标检测 | **接口已留好**（`ObjectDetector` 端口）。装了能补景别/站位/人物计数的 CV 缺口；模型权重 6MB 需联网下载，作为可选增强 |
+| [google/langextract](https://github.com/google/langextract) | 38.9k | 从非结构化文本抽结构化信息 | 它做的是"给定文本抽字段"，我们已有 JSON Schema 强约束 + 修复重试；且我们的规则是 PRD 专有的（约束强度分级、降级检测），通用库覆盖不到 |
+| [Unstructured-IO/unstructured](https://github.com/Unstructured-IO/unstructured) | 15.5k | 文档 ETL | 方向不同（处理 PDF/Word，不处理视频） |
+| [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) | **5.2k** | 镜头切分 | **已采用** ✅ 见上一节 |
+
+**垂直方向 —— 找到但没直接抄**
+
+| 项目 | 星数 | 它做了什么 | 为什么不直接抄 |
+|---|---|---|---|
+| [viral-video-replicator](https://github.com/dingtom336-gif/viral-video-replicator) | — | 目标几乎相同：FFmpeg 抽帧 → 视觉模型 → Seedance 提示词 | 是 Claude Code 的 SKILL.md（提示词工程，无代码架构）。它的**降级链**设计值得吸收：每个失败点都写明"用户还能拿到什么、质量损失多少" |
+| [TransNetV2](https://github.com/soCzech/TransNetV2) | 1.0k | 神经网络镜头切分，擅长**渐变转场** | 需要 PyTorch + 权重；PySceneDetect 已够用。**是我们下一个该补的能力**（溶解/淡入淡出当前会漏） |
+| [video-to-prompt](https://github.com/imooooc/video-to-prompt) | — | 浏览器版视频反推，支持 Seedance | 纯前端 + Gemini，单条提示词输出，没有框架契约与位置标注 |
+| [promptlab](https://github.com/gracech0322-cmd/promptlab-image-video-to-prompt) | — | Chrome 扩展，Seedance 2.0 风格提示词 | 抽帧采样策略（按视频时长决定帧数、采样 0%~95% 避开黑帧）可以借鉴；它明确不做镜头切分 |
+| [awesome-seedance](https://github.com/LearnPrompt/awesome-seedance) | 1.5k | 463 个 Seedance 提示词案例库 | 是**资产**不是代码。可与我们的 `TEMPLATES`/`PHRASES` 互为补充验证 |
+| [seedance-prompt-skill](https://github.com/songguoxs/seedance-prompt-skill) | 2.8k | Seedance 2.0 提示词 Skill | 同上，是提示词工程产物 |
+| [MA-LMM](https://github.com/boheumd/MA-LMM) / [VideoLucy](https://github.com/worldbench/VideoLucy) | 354 / 69 | 长视频理解（记忆增强） | 学术模型，面向"小时级视频问答"；我们的素材是 15 秒短视频，MiMo 直接够用 |
 
 **结论**：没有找到能直接复用的完整实现。所有开源项目都停在
 "抽帧 → 视觉模型 → 一条提示词"，**没有人做**：
 框架契约化、四类位置标注、三色门禁、14 项交付闸门、短语级降级检测。
 这几块是本产品的差异点，也是必须自己写的部分。
+
+唯一值得直接换掉的实现层是镜头切分（已换成 PySceneDetect）。
+下一个值得补的是**人体检测**（ultralytics），它能把你 PRD 里的
+景别 ≥85% / 站位 ≥95% / 人物计数 ≥95% 从"模型判断"升级为"CV 强判断"，
+置信度也会从 `VLM_ALONE`(0.70) 升到 `CV`(0.95)。
 
 ### 还该吸收但尚未做的
 

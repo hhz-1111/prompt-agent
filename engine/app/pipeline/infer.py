@@ -15,10 +15,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from engine.core.contracts import (
+    BlockingEstimate,
     Conflict,
+    FramingEstimate,
     InferenceReport,
     SemanticSummary,
     ShotBoundary,
@@ -73,12 +75,27 @@ class Inferencer:
     semantic: SemanticInducer | None = None
     transcriber: Transcriber | None = None
     motion_analyzer: MotionAnalyzer | None = None
+    person_detector: cv_layer.YoloPersonDetector | None = None
+    """人体检测（可选增强）。有它就把景别/站位/人数升级为 CV 强判断。"""
 
     # 中间产物：回归测试与 UI 诊断都要看
     _frame_means: list[FrameMean] = field(default_factory=list, init=False)
     capabilities: cv_layer.CvCapabilities = field(
         default_factory=cv_layer.detect_capabilities, init=False
     )
+
+    def __post_init__(self) -> None:
+        """能力盘点必须反映**实际注入的检测器**，而不是本机装了什么。
+
+        否则：注入了替身检测器的测试会看到"环境有 YOLO"的能力表，
+        而实际跑的却是替身 —— 能力和实现脱节，降级判断就会出错。
+        """
+        self.capabilities = replace(
+            self.capabilities,
+            framing=self.person_detector is not None or self.capabilities.framing,
+            blocking=self.person_detector is not None or self.capabilities.blocking,
+            people_count=self.person_detector is not None or self.capabilities.people_count,
+        )
 
     def infer(
         self,
@@ -159,7 +176,7 @@ class Inferencer:
 
         # ---- 步骤 5：交叉校验（CV 优先） ----
         progress("交叉校验", 0.88)
-        signals, conflicts = self._fuse(shots, understandings)
+        signals, conflicts = self._fuse(shots, understandings, frames)
 
         # ---- 步骤 6：置信度分级已内联在 provenance ----
         progress("汇总", 0.95)
@@ -221,9 +238,19 @@ class Inferencer:
         self,
         shots: Sequence[ShotBoundary],
         understandings: Sequence[ShotUnderstanding],
+        frames: Sequence[str] = (),
     ) -> tuple[list[ShotSignals], list[Conflict]]:
-        """CV 与模型结论融合。**冲突时以 CV 为准并降置信度**。"""
+        """CV 与模型结论融合。**冲突时以 CV 为准并降置信度**。
+
+        人体检测可用时，景别/站位/人数走 CV；不可用时退回模型判断，
+        并按 ``VLM_ALONE``(0.70) 记置信度 —— 差距是实打实的，不粉饰。
+        """
         by_index = {u.shot_index: u for u in understandings}
+        # 关键帧与镜头一一对应时才能逐镜头检测；不一致就不做，避免错位
+        frame_by_shot = (
+            dict(zip((s.index for s in shots), frames))
+            if len(frames) == len(shots) else {}
+        )
         conflicts: list[Conflict] = []
         signals: list[ShotSignals] = []
 
@@ -240,8 +267,7 @@ class Inferencer:
             if motion is not None and understanding is not None:
                 model_rig = RIG_BY_MOTION.get(motion.kind, "")
                 if model_rig and understanding.camera not in ("", "unknown"):
-                    agreed = _camera_agrees(understanding.camera, motion.kind)
-                    if not agreed:
+                    if not _camera_agrees(understanding.camera, motion.kind):
                         conflicts.append(Conflict(
                             field="B4_camera.rig",
                             shot_index=shot.index,
@@ -255,33 +281,65 @@ class Inferencer:
                             ),
                         ))
 
-            # 景别与站位：CV 未覆盖时用模型值，置信度按"模型单独判断"计
-            framing = None
-            if understanding is not None and understanding.framing not in ("", "unknown"):
-                from engine.core.contracts import FramingEstimate
-
-                basis = (
-                    ConfidenceBasis.CV
-                    if self.capabilities.framing
-                    else ConfidenceBasis.VLM_ALONE
-                )
-                framing = FramingEstimate(
-                    kind=understanding.framing,
-                    confidence=compute_confidence(
-                        basis, consistency="single", evidence="timecode_and_frame"
-                    ),
-                    note="CV 未覆盖，由模型单独判断" if not self.capabilities.framing else "",
-                )
-
+            framing, blocking, people = self._analyze_person(shot, frame_by_shot, understanding)
             signals.append(ShotSignals(
                 boundary=shot,
                 motion=motion,
                 framing=framing,
-                people_count=0,
-                people_confidence=0.0,
-                blocking=(),
+                people_count=people,
+                people_confidence=(
+                    compute_confidence(
+                        ConfidenceBasis.CV, consistency="single",
+                        evidence="timecode_and_frame",
+                    ) if self.person_detector is not None else 0.0
+                ),
+                blocking=blocking,
             ))
         return signals, conflicts
+
+    def _analyze_person(
+        self,
+        shot: ShotBoundary,
+        frame_by_shot: Mapping[int, str],
+        understanding: ShotUnderstanding | None,
+    ) -> tuple[
+        FramingEstimate | None,
+        tuple[BlockingEstimate, ...],
+        int,
+    ]:
+        """景别 / 站位 / 人数：优先 CV，退路是模型判断。
+
+        ``CV > 模型`` 不是随便定的：人体框是几何量测，模型是语义判断。
+        景别与站位在 PRD 里分别是"中"和"致命"影响级维度，
+        有确定算法就必须用确定算法。
+        """
+        frame = frame_by_shot.get(shot.index)
+        if self.person_detector is not None and frame:
+            try:
+                boxes = self.person_detector.detect(frame)
+            except Exception:
+                boxes = []
+            if boxes:
+                blocking, count, _ = cv_layer.blocking_from_boxes(boxes)
+                primary = max(boxes, key=lambda b: b.height_ratio)
+                return cv_layer.framing_from_person(primary), blocking, count
+            # 检测不到人也要区分"画面里真没人"与"检测失败"
+            return None, (), 0
+
+        if understanding is not None and understanding.framing not in ("", "unknown"):
+            return (
+                FramingEstimate(
+                    kind=understanding.framing,
+                    confidence=compute_confidence(
+                        ConfidenceBasis.VLM_ALONE, consistency="single",
+                        evidence="timecode_and_frame",
+                    ),
+                    note="CV 未覆盖，由模型单独判断",
+                ),
+                (),
+                0,
+            )
+        return None, (), 0
 
     def _build_provenance(
         self,
@@ -450,6 +508,14 @@ def build_inferencer(
     if scene_shots.available:
         detector = scene_shots
 
+    # 人体检测是可选增强：装了 ultralytics 就把景别/站位升为 CV 强判断
+    person_detector = None
+    capabilities = cv_layer.detect_capabilities()
+    if capabilities.person_detector:
+        person_detector = cv_layer.YoloPersonDetector(
+            capabilities.person_detector, workspace=resolved.workspace_dir / "models"
+        )
+
     use_llm = with_llm and resolved.has_llm
     return Inferencer(
         settings=resolved,
@@ -459,4 +525,5 @@ def build_inferencer(
         semantic=MimoSemanticInducer(resolved) if use_llm else None,
         transcriber=MimoTranscriber(resolved) if use_llm else None,
         motion_analyzer=None,
+        person_detector=person_detector,
     )

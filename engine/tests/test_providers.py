@@ -611,8 +611,54 @@ class TestInferencer:
         assert any("语音识别失败" in d for d in report.degradations)
 
     def test_cv_gaps_are_declared_in_degradations(self):
-        report = _inferencer().infer("fake.mp4")
+        """没有人体检测时，缺口必须如实登记 —— 那是置信度降档的依据。"""
+        from engine.app.providers.cv import CvCapabilities
+
+        inferencer = _inferencer()
+        # 显式把能力表压成"只有运镜"，模拟没装 ultralytics 的环境
+        inferencer.capabilities = CvCapabilities(
+            motion_from_luma=True, framing=False, blocking=False, people_count=False
+        )
+        report = inferencer.infer("fake.mp4")
         assert any("CV 能力缺口" in d for d in report.degradations)
+        assert any("景别" in d for d in report.degradations)
+
+    def test_person_detector_upgrades_framing_to_cv(self):
+        """有人体检测时，景别/站位/人数走 CV，置信度升到 CV 档(0.95)。
+
+        这是 PRD §6.1.2 的核心主张：能算的绝不让模型猜。
+        """
+        from engine.app.providers.cv import PersonBox, YoloPersonDetector
+
+        class StubDetector(YoloPersonDetector):
+            def detect(self, frame_path):  # type: ignore[override]
+                return [
+                    PersonBox(0.30, 0.05, 0.70, 0.97, 0.92),  # 前景主体，高度 0.92
+                    PersonBox(0.80, 0.50, 0.90, 0.61, 0.55),  # 背景路人
+                ]
+
+        inferencer = _inferencer(person_detector=StubDetector("stub"))
+        report = inferencer.infer("fake.mp4")
+
+        # 帧数与镜头数一致时才会逐镜头检测；替身探针给 2 帧、2 镜头
+        assert report.shots
+        first = report.shots[0]
+        assert first.framing is not None
+        assert first.framing.kind == "近景", "高度 0.92 应判近景"
+        assert first.framing.confidence == pytest.approx(0.95 * 0.85 * 1.0)
+        assert first.people_count == 1, "背景路人不计入出镜人数"
+        assert first.blocking and first.blocking[0].side == "center"
+
+    def test_framing_falls_back_to_model_without_detector(self):
+        """没有人体检测时退回模型判断，置信度按 VLM_ALONE 记。"""
+        inferencer = _inferencer()
+        inferencer.person_detector = None
+        report = inferencer.infer("fake.mp4")
+        framing = report.shots[0].framing
+        assert framing is not None
+        assert framing.kind == "中景"
+        assert framing.note == "CV 未覆盖，由模型单独判断"
+        assert framing.confidence == pytest.approx(0.70 * 0.85 * 1.0)
 
 
 # ==========================================================================

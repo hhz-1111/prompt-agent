@@ -15,10 +15,14 @@ app = [
     "uvicorn[standard]>=0.30",
     "python-multipart>=0.0.9",
     "httpx>=0.27",
-    # 镜头切分：自研的全帧均值实现会漏切低对比度切镜（实测 9 秒 5 个切镜检出 0 个）。
-    # 装不上时会自动退回内置的 ffmpeg 逐帧均值实现，不影响启动。
-    "scenedetect>=0.6.4",
 ]
+# 镜头切分：自研的全帧均值实现会漏切低对比度切镜（实测 9 秒 5 个切镜检出 0 个）。
+# 装不上时自动退回内置的 ffmpeg 逐帧均值实现。
+shots = ["scenedetect>=0.6.4"]
+# 人体检测：让景别/站位/人物计数升级为 CV 强判断，
+# 置信度从 VLM_ALONE(0.70) 升到 CV(0.95)，必写维度覆盖显著提升。
+# 依赖 torch（CPU 版约 200MB），装不上时退回模型单独判断。
+vision = ["ultralytics>=8.3"]
 dev = ["pytest>=8.0"]
 
 [tool.setuptools]

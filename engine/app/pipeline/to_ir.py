@@ -63,6 +63,7 @@ def build_ir(report: InferenceReport) -> dict:
     _fill_scene(ir, report)
     _fill_persons(ir, report)
     _fill_camera(ir, report)
+    _fill_blocking(ir, report)
     _fill_quality(ir, report)
     _fill_beats(ir, report)
     _fill_logline(ir, report)
@@ -122,6 +123,47 @@ MAX_REVERSE_ENGINEERED_PERSONS = 4
 
 # 群体词：出现这些的"人物"标签应视为群体，不进人物清单（PRD D2 群体防细化）
 _GROUP_WORDS = ("观众", "学员", "顾客", "路人", "人群", "大家", "其他人", "群众", "粉丝")
+
+
+def _fill_blocking(ir: dict, report: InferenceReport) -> None:
+    """从跨镜头的站位检测结果归纳出"谁一直在左、谁一直在右"。
+
+    站位是**致命级**维度（错了人物关系错乱），而它恰好是 CV 算得最准的：
+    人体框中心 x 是几何量测。所以只要有检测结果就一定要写进 LOCK 位，
+    而不是留给用户从零填。
+
+    判据：某侧出现在**多数镜头**里才算稳定站位。只出现一次不算 ——
+    那可能是人物走动，不是固定站位。
+    """
+    per_shot = [s.blocking for s in report.shots if s.blocking]
+    if not per_shot:
+        ir["locked"]["B3_blocking"]["positions"] = []
+        return
+
+    def dominant(side: str) -> tuple[int, float]:
+        hits = [b.x_ratio for shot in per_shot for b in shot if b.side == side]
+        if not hits:
+            return 0, 0.0
+        return len(hits), round(sum(hits) / len(hits), 3)
+
+    threshold = max(1, int(len(per_shot) * 0.6))
+    parts: list[str] = []
+    for side, label in (("left", "左侧"), ("right", "右侧")):
+        count, average = dominant(side)
+        if count >= threshold:
+            parts.append(f"人物始终在画面{label}（中心 x≈{average}）")
+
+    if len(parts) == 2:
+        # 多人且左右稳定：相对关系是"复刻像不像"的关键约束
+        parts.append("两人位置全程禁止变动")
+    elif not parts:
+        # 单人成片最常见的情形：**始终居中**。这本身是有效约束
+        # （PRD 把站位列为致命级维度），不能因为"不左不右"就丢掉。
+        count, average = dominant("center")
+        if count and count >= threshold:
+            parts.append(f"人物始终位于画面中央（中心 x≈{average}），位置全程禁止变动")
+
+    ir["locked"]["B3_blocking"]["positions"] = parts
 
 
 def _fill_persons(ir: dict, report: InferenceReport) -> None:
