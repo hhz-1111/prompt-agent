@@ -1,0 +1,18 @@
+# ---- 密钥与本地环境 ----
+.env
+*.local
+
+# ---- Python ----
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# ---- 运行时产物 ----
+workspace/
+.probe/
+
+# ---- 前端 ----
+node_modules/
+web/dist/
