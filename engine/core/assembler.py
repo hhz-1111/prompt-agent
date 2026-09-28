@@ -525,14 +525,22 @@ def _blink_text(library: ph.PhraseLibrary, key: str) -> str:
 
 
 def _render_blocking(ir: Mapping[str, Any]) -> list[str]:
-    """站位渲染。**永不可裁**（框架 §9.2）。"""
+    """站位渲染。**永不可裁**（框架 §9.2）。
+
+    固定尾句「位置全程禁止变动」在这里**统一追加**，不依赖数据里带没带 ——
+    它是框架的硬约束，不能因为反推器没写就消失。
+    但如果数据里已经有了（比如双人场景由 ``_fill_blocking`` 直接写出），
+    就不要再叠一遍：否则会渲出「……位置全程禁止变动，位置全程禁止变动。」，
+    实测踩过这个叠字。
+    """
     blocking = ir.get("locked", {}).get("B3_blocking", {})
     lines: list[str] = []
-    positions = blocking.get("positions") or []
+    positions = [str(p).strip() for p in (blocking.get("positions") or []) if str(p).strip()]
     if positions:
-        joined = "、".join(str(p) for p in positions if str(p).strip())
-        if joined:
-            lines.append(f"{joined}，位置全程禁止变动。")
+        joined = "、".join(p.rstrip("。，") for p in positions)
+        if "位置全程禁止变动" not in joined:
+            joined = f"{joined}，位置全程禁止变动"
+        lines.append(joined + "。")
     for key in ("occlusion", "eye_line", "off_screen"):
         text = str(blocking.get(key) or "").strip()
         if text:

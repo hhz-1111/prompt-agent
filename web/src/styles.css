@@ -253,6 +253,24 @@ textarea { resize: vertical; font-family: inherit; }
 .pos__readonly.is-locked { cursor: default; }
 .pos__readonly.is-locked:hover { border-color: transparent; background: transparent; }
 .pos__note { margin: 4px 0 0; }
+.pos__pending { color: var(--warn); font-style: normal; }
+
+/* ---------- 素材卡片（蓝位按素材分组，而不是按字段平铺）---------- */
+.slot-card {
+  border: 1px solid var(--blue);
+  background: var(--blue-bg);
+  border-radius: 8px;
+  padding: 9px 11px;
+  margin-bottom: 8px;
+}
+.slot-card.is-bound { border-color: var(--ok); background: #f0fdf4; }
+.slot-card__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.slot-card__head strong { font-size: 14px; }
+.slot-card__type { width: auto; min-width: 120px; padding: 2px 6px; font-size: 12px; }
+.slot-card__bind { display: flex; gap: 6px; margin-top: 8px; }
+.slot-card__more { margin-top: 6px; font-size: 12px; }
+.slot-card__more summary { cursor: pointer; color: var(--ink-2); }
+.slot-card__more .positions { margin-top: 6px; }
 
 /* ---------- 交付 ---------- */
 .delivery__meta { display: flex; gap: 14px; align-items: center; padding: 10px 14px 0; flex-wrap: wrap; }

@@ -67,6 +67,44 @@ RIG_BY_MOTION: dict[str, str] = {
     "handheld": "手持自拍",
 }
 
+# 模型机位表述 → 框架 rig 白名单。CV 给不出结论时用它兜底。
+RIG_BY_MODEL_CAMERA: dict[str, str] = {
+    "固定": "固定机位全程不变",
+    "推近": "稳定推近",
+    "跟拍": "斯坦尼康跟拍",
+    "横摇": "斯坦尼康跟拍",
+    "手持": "手持自拍",
+    "平视": "固定平视",
+    "正面": "固定平视",
+    "过肩": "过肩正反打",
+    "俯拍": "固定平视",
+    "仰拍": "固定平视",
+}
+
+
+def resolve_rig(
+    motion: "MotionEstimate | None",
+    understanding: "ShotUnderstanding | None",
+) -> tuple[str, str]:
+    """决定这条片子的机位档位，返回 ``(rig, 来源说明)``。
+
+    优先级：**CV 的确定性结论 > 模型的语义判断 > 留空**。
+
+    为什么要这个兜底：CV 的亮度序列分析**分不清"镜头动"与"被摄体动"**，
+    所以在真实内容上它经常只能返回 ``unknown``（这是刻意的保守，
+    见 ``providers/cv.py``）。此时不能让机位字段空着 —— 那是**高影响级**
+    维度，模型给的"固定/推近/跟拍"虽然不如 CV 硬，但远好过留空。
+    """
+    if motion is not None:
+        rig = RIG_BY_MOTION.get(motion.kind, "")
+        if rig:
+            return rig, "CV"
+    if understanding is not None:
+        rig = RIG_BY_MODEL_CAMERA.get(understanding.camera, "")
+        if rig:
+            return rig, "模型"
+    return "", ""
+
 
 def _noop(stage: str, progress: float) -> None:  # pragma: no cover - 默认回调
     return None

@@ -520,6 +520,26 @@ class TestGates:
         assert result.blocking
         assert "没绑定的场景图" in result.detail
 
+    def test_g1_blocks_on_unresolved_handle(self, lib):
+        """素材引用没解析成 [图N] 时必须阻断。
+
+        实测盲区：人物改名后 ``multi_view_ref`` 没同步，
+        交付物里出现 ``形象参考[王姐多视图]``。它既不是 【】，
+        看起来又"像"一个引用，但已经是废的。
+        """
+        ir = _sample_ir()
+        ir["locked"]["B2_person"][0]["multi_view_ref"] = "不存在的素材名"
+        doc = assembler.assemble(ir, lib)
+        result = gates.g1_placeholder_residue(doc, ir)
+        assert result.blocking
+        assert "未解析成句柄" in result.detail
+        assert result.evidence, "必须给出具体的未解析引用"
+
+    def test_g1_passes_when_all_handles_resolve(self, lib):
+        ir = _sample_ir()
+        doc = assembler.assemble(ir, lib)
+        assert not gates.g1_placeholder_residue(doc, ir).blocking
+
     def test_g2_blocks_on_quota_overflow(self, lib):
         ir = _sample_ir()
         ir["references"] = [
@@ -720,6 +740,76 @@ class TestGates:
         assert g7.status == gates.WARN
         assert "超出" in g7.detail and "压掉" in g7.detail
         assert report.summary_lines()[-1].startswith("→")
+
+
+class TestPersonRenameCascade:
+    """改人物名必须带动所有派生引用。
+
+    实测踩过：改名后交付物同时出现「王姐形象参考[图1]」和
+    「穿紫色连衣裙的女子声音音色参考[音频1]」，且闸门 G6 误报
+    "王姐缺音色绑定" —— 音色其实有，只是还挂在旧名字下。
+    """
+
+    def test_rename_updates_audio_binding(self):
+        """按**名字**匹配音色，不按索引 —— B6_audio 顺序来自台词说话人，
+        与 B2_person 下标不保证一致。"""
+        ir = _sample_ir()
+        # 故意把音色放在与人物下标不同的位置，验证不依赖索引
+        ir["locked"]["B6_audio"] = [
+            {"speaker": "李姐", "audio_ref": "李姐音频", "volume_mode": "normal"},
+            {"speaker": "王姐", "audio_ref": "王姐音频", "volume_mode": "normal"},
+        ]
+        touched = fw.cascade_person_rename(ir, 0, "王姐", "小美")
+        by_speaker = {t["speaker"]: t["audio_ref"] for t in ir["locked"]["B6_audio"]}
+        assert by_speaker["小美"] == "小美音频"
+        assert by_speaker["李姐"] == "李姐音频"
+        assert any("B6_audio[1]" in path for path in touched)
+
+    def test_rename_updates_reference_slots(self):
+        ir = _sample_ir()
+        touched = fw.cascade_person_rename(ir, 0, "王姐", "小美")
+        slots = [s for ref in ir["references"] for s in ref.get("slots", [])]
+        assert "小美多视图" in slots
+        assert not any("王姐" in s for s in slots)
+        assert any("references[" in path for path in touched)
+
+    def test_rename_updates_dialogue_speaker(self):
+        ir = _sample_ir()
+        fw.cascade_person_rename(ir, 0, "王姐", "小美")
+        speakers = {
+            (b.get("dialogue") or {}).get("speaker")
+            for b in ir["creative"]["C2_beats"]
+        }
+        assert "小美" in speakers
+        assert "王姐" not in speakers
+
+    def test_rename_keeps_others_untouched(self):
+        ir = _sample_ir()
+        fw.cascade_person_rename(ir, 0, "王姐", "小美")
+        assert ir["locked"]["B2_person"][1]["name"] == "李姐"
+        assert any("李姐" in s for ref in ir["references"] for s in ref.get("slots", []))
+
+    def test_noop_on_same_or_empty_name(self):
+        ir = _sample_ir()
+        assert fw.cascade_person_rename(ir, 0, "王姐", "王姐") == []
+        assert fw.cascade_person_rename(ir, 0, "", "小美") == []
+
+
+class TestBlockingRenderNoDuplication:
+    def test_fixed_tail_is_added_when_missing(self):
+        doc = assembler.assemble(_sample_ir(), ph.load_library())
+        body = doc.section(fw.SEC_LOCKED).body
+        assert "位置全程禁止变动" in body
+
+    def test_fixed_tail_is_not_duplicated(self):
+        """数据里已带那句时不能再叠一遍 —— 实测渲出过叠字。"""
+        ir = _sample_ir()
+        ir["locked"]["B3_blocking"]["positions"] = [
+            "李姐始终在画面右侧", "王姐始终在画面左侧", "位置全程禁止变动",
+        ]
+        doc = assembler.assemble(ir, ph.load_library())
+        body = doc.section(fw.SEC_LOCKED).body
+        assert body.count("位置全程禁止变动") == 1
 
 
 # ==========================================================================

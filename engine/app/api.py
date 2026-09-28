@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -290,10 +291,22 @@ def _register_routes(
             # 锁定位在 API 层也必须拦住（PRD F2.3）
             raise HTTPException(403, decision.reason)
 
+        # 旧值必须在写入**之前**取 —— 写完再取拿到的已经是新值，
+        # 拿它当旧名字去做级联替换会完全失效（实测踩过）。
+        previous = str(current or "")
         try:
             fw.set_in(project.ir, payload.path, payload.value)
         except (KeyError, IndexError, TypeError) as exc:
             raise HTTPException(400, f"路径不可写：{payload.path}（{exc}）") from exc
+
+        # 改人物名要带动一串引用，否则交付物自相矛盾、闸门误报
+        cascaded: list[str] = []
+        if re.search(r"B2_person\[\d+\]\.name$", payload.path):
+            match = re.search(r"B2_person\[(\d+)\]", payload.path)
+            if match:
+                cascaded = fw.cascade_person_rename(
+                    project.ir, int(match.group(1)), previous, str(payload.value or "")
+                )
 
         store.save(project)
         table = positions.build_positions(project.ir, _prov(project))
@@ -303,6 +316,7 @@ def _register_routes(
             "path": payload.path,
             "value": payload.value,
             "position": pos.to_dict() if pos else None,
+            "cascaded": cascaded,
         }
 
     @router.put("/projects/{project_id}/dialogue")
@@ -449,7 +463,21 @@ def _blocking_hints(ir: dict[str, Any]) -> list[str]:
     这些不是错误，是**待办**：反推不出人物时，交付物会缺"人物一致性"整句，
     而那句话决定"像不像原片"。只在 G13 里出现一条告警太容易被忽略。
     """
+    from engine.core.types import UNKNOWN
+
     hints: list[str] = []
+
+    # 占位符泄漏检查：unknown 是内部标记，绝不该出现在用户界面上。
+    # 实测出现过场景光线显示为 "unknown"，用户看到根本不知道该填什么。
+    pending = [p for p in framework_paths(ir) if fw.get_in(ir, p) in (UNKNOWN, "unknown")]
+    if pending:
+        hints.append(
+            f"{len(pending)} 个位置未反推出来（界面显示为「待填」，留空是刻意的 —— "
+            f"低置信度宁可让你填，也不猜）："
+            f"{'、'.join(fw.label_of(p) for p in pending[:6])}"
+            + ("…" if len(pending) > 6 else "")
+        )
+
     if not ir.get("locked", {}).get("B2_person"):
         hints.append(
             "未反推出人物清单：请补充角色名并绑定多视图素材，"
@@ -466,6 +494,19 @@ def _blocking_hints(ir: dict[str, Any]) -> list[str]:
             "台词为空：请粘贴你自己的台词。台词是你的创作，Agent 不代写（红线 3）。"
         )
     return hints
+
+
+def framework_paths(ir: dict[str, Any]) -> list[str]:
+    """列出 IR 里所有属于契约的具体位置路径（排除元数据与非位置字段）。"""
+    from engine.core.contracts import NON_POSITION_KEYS
+
+    paths: list[str] = []
+    for path, _ in fw.flatten(ir):
+        if path.split(".", 1)[0].split("[", 1)[0] in NON_POSITION_KEYS:
+            continue
+        if fw.spec_for(path) is not None:
+            paths.append(path)
+    return paths
 
 
 def _run_inference(store: ProjectStore, settings: Settings, project_id: str) -> None:

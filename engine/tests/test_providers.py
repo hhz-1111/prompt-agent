@@ -229,22 +229,37 @@ class TestCvLayer:
 
     def test_stable_sequence_is_fixed(self):
         shot = ShotBoundary(1, 0, 2000)
-        frames = self._frames([100.0] * 50)
+        frames = self._frames([100.0] * 60)
         result = cv_layer.analyze_motion(frames, shot)
         assert result.kind == "fixed"
         assert "固定机位" in result.note
 
-    def test_monotonic_sequence_is_push_in(self):
+    def test_monotonic_large_swing_is_push_in(self):
         shot = ShotBoundary(1, 0, 2000)
-        frames = self._frames([100.0 + i * 3 for i in range(50)])
+        frames = self._frames([100.0 + i * 3 for i in range(60)])
         result = cv_layer.analyze_motion(frames, shot)
         assert result.kind == "push_in"
 
-    def test_alternating_sequence_is_handheld(self):
+    def test_alternating_sequence_is_unknown_not_a_guess(self):
+        """亮度序列**分不清手持与横摇**，所以不能硬判。
+
+        这条测试此前断言 handheld —— 那是在测试一个我后来撤掉的能力。
+        实测发现：固定机位视频里人物做深蹲、大面积移位时，
+        亮度照样剧烈变化，算法把**被摄体运动**误判成了镜头运动。
+        现在只在有把握时给 fixed / push_in，其余交给视觉模型。
+        """
         shot = ShotBoundary(1, 0, 2000)
-        values = [100.0 + (8 if i % 2 else -8) for i in range(50)]
+        values = [100.0 + (8 if i % 2 else -8) for i in range(60)]
         result = cv_layer.analyze_motion(frames=self._frames(values), shot=shot)
-        assert result.kind == "handheld"
+        assert result.kind == "unknown"
+        assert "无法区分镜头运动与被摄体运动" in result.note
+        assert result.confidence == 0.0, "给不出结论就不该给置信度"
+
+    def test_moderate_swing_is_unknown(self):
+        """中等幅度变化在真实内容里多为被摄体运动，不该判成运镜。"""
+        shot = ShotBoundary(1, 0, 2000)
+        frames = self._frames([100.0 + (i % 5) * 0.6 for i in range(60)])
+        assert cv_layer.analyze_motion(frames, shot).kind == "unknown"
 
     def test_too_few_frames_is_unknown_not_a_guess(self):
         """帧不够就说 unknown，绝不编一个运镜档位。"""

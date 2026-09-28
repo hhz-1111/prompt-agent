@@ -124,6 +124,62 @@ MAX_REVERSE_ENGINEERED_PERSONS = 4
 # 群体词：出现这些的"人物"标签应视为群体，不进人物清单（PRD D2 群体防细化）
 _GROUP_WORDS = ("观众", "学员", "顾客", "路人", "人群", "大家", "其他人", "群众", "粉丝")
 
+# 位置词：**相对视角**，同一人在不同镜头里会被标成不同位置。
+# 实测：同一个人在 5 个镜头里被叫成「左侧蓝衣男子」「右侧蓝衣男子」「后方蓝衣男子」——
+# 完全无法作为人物身份依据，必须从标签里剥掉。
+# 位置信息另有来源：CV 人体框中心 x（确定性量测），比模型描述准得多。
+_POSITION_WORDS = (
+    "左侧", "右侧", "左边", "右边", "左方", "右方", "前方", "后方",
+    "前景", "背景", "画面左", "画面右", "居中", "中间",
+)
+
+# 稳定的外观特征词。**这些才是人物身份的依据**：服装颜色在一段片子里不变，
+# 而位置会变、性别是模型的推断（PRD 红线 5 禁止添加未提供的性别信息）。
+_APPEARANCE_WORDS = (
+    "红", "橙", "黄", "绿", "青", "蓝", "紫", "黑", "白", "灰", "粉", "棕", "褐",
+    "西装", "衬衫", "外套", "大衣", "裙", "T恤", "毛衣", "运动服", "制服", "围裙",
+    "长发", "短发", "卷发", "马尾", "光头", "眼镜",
+)
+
+
+def canonical_person_key(label: str) -> str:
+    """从人物标签里提取**身份键**，用于跨镜头合并同一个人。
+
+    剥掉位置词，留下外观特征（服装颜色、发饰）作为身份依据。
+    拿不到任何外观特征时退回剥离后的标签 —— 宁可分成两个，也不要错误合并。
+    """
+    cleaned = label
+    for word in _POSITION_WORDS:
+        cleaned = cleaned.replace(word, "")
+    features = [w for w in _APPEARANCE_WORDS if w in cleaned]
+    if features:
+        return "+".join(sorted(set(features)))
+    return cleaned.strip() or label
+
+
+def dedupe_person_labels(labels: Sequence[str]) -> list[str]:
+    """按身份键合并同一个人，返回去重后的规范名。
+
+    同一身份出现多次时，选**出现次数最多**的标签；次数相同则选最短的
+    （通常最干净，少带位置修饰）。
+    """
+    from collections import Counter
+
+    groups: dict[str, Counter] = {}
+    for label in labels:
+        cleaned = _text(label)
+        if not cleaned:
+            continue
+        if any(word in cleaned for word in _GROUP_WORDS):
+            continue
+        groups.setdefault(canonical_person_key(cleaned), Counter())[cleaned] += 1
+
+    names: list[str] = []
+    for counter in groups.values():
+        best = max(counter.items(), key=lambda kv: (kv[1], -len(kv[0])))
+        names.append(best[0])
+    return names
+
 
 def _fill_blocking(ir: dict, report: InferenceReport) -> None:
     """从跨镜头的站位检测结果归纳出"谁一直在左、谁一直在右"。
@@ -161,7 +217,8 @@ def _fill_blocking(ir: dict, report: InferenceReport) -> None:
         # （PRD 把站位列为致命级维度），不能因为"不左不右"就丢掉。
         count, average = dominant("center")
         if count and count >= threshold:
-            parts.append(f"人物始终位于画面中央（中心 x≈{average}），位置全程禁止变动")
+            parts.append(f"人物始终位于画面中央（中心 x≈{average}）")
+            parts.append("位置全程禁止变动")
 
     ir["locked"]["B3_blocking"]["positions"] = parts
 
@@ -172,24 +229,27 @@ def _fill_persons(ir: dict, report: InferenceReport) -> None:
     名字来源有两路，优先级从高到低：
 
     1. **ASR 说话人**（``说话人：内容`` 或声纹分离）—— 这是"谁在说"的直接证据；
-    2. **视觉模型的人物标签**（如"左侧女子"）—— 只能区分形象，不知道名字。
+    2. **视觉模型的人物标签**，但必须**跨镜头去重**。
 
-    **群体标签会被过滤掉**：``台下观众``、``8名学员`` 是群体不是个体，
-    给群体建多视图既浪费配额又违反 D2 群体防细化。
+    为什么去重是必需的：视觉模型给的位置词是**相对视角**，
+    同一个人在 5 个镜头里可能被叫成「左侧蓝衣男子」「右侧蓝衣男子」
+    「后方蓝衣男子」。不去重的话，一条 2 人视频会变出 4 个人物清单，
+    用户会以为要准备 4 张多视图素材 —— 实测踩过这个坑。
+
+    群体标签（``台下观众``）也会被过滤（D2 群体防细化）。
     两路都拿不到就留空等用户补，绝不编角色名（红线 5）。
     """
     people: list[str] = []
     for segment in report.transcript:
         if segment.speaker and segment.speaker not in people:
             people.append(segment.speaker)
+
+    observed: list[str] = []
     for understanding in report.understandings:
-        for name in understanding.people:
-            cleaned = _text(name)
-            if not cleaned or cleaned in people:
-                continue
-            if any(word in cleaned for word in _GROUP_WORDS):
-                continue
-            people.append(cleaned)
+        observed.extend(understanding.people)
+    for name in dedupe_person_labels(observed):
+        if name not in people:
+            people.append(name)
 
     blink = BLINK_BY_GENRE.get(
         report.semantic.genre if report.semantic else Genre.DIALOGUE,
@@ -212,18 +272,19 @@ def _fill_persons(ir: dict, report: InferenceReport) -> None:
 
 
 def person_overflow_note(report: InferenceReport) -> str:
-    """人物数超上限时的说明 —— 由调用方放进 degradations，如实告知。"""
-    names: list[str] = []
+    """人物数超上限时的说明 —— 由调用方放进 degradations，如实告知。
+
+    统计的是**去重后**的人物数，否则同一个人被标成三个位置就会误报超限。
+    """
+    observed: list[str] = []
     for understanding in report.understandings:
-        for name in understanding.people:
-            cleaned = _text(name)
-            if cleaned and cleaned not in names:
-                names.append(cleaned)
+        observed.extend(understanding.people)
+    names = dedupe_person_labels(observed)
     if len(names) <= MAX_REVERSE_ENGINEERED_PERSONS:
         return ""
     return (
-        f"识别到 {len(names)} 个人物标签，已截取前 {MAX_REVERSE_ENGINEERED_PERSONS} 个"
-        f"（其余可能是群体或次要人物）：{'、'.join(names[MAX_REVERSE_ENGINEERED_PERSONS:])}。"
+        f"识别到 {len(names)} 个人物，已截取前 {MAX_REVERSE_ENGINEERED_PERSONS} 个"
+        f"（其余可能是次要人物）：{'、'.join(names[MAX_REVERSE_ENGINEERED_PERSONS:])}。"
         f"请按实际需要增删角色，每多一个角色就多占一张参考图配额。"
     )
 
@@ -237,15 +298,21 @@ def _fill_camera(ir: dict, report: InferenceReport) -> None:
     ]
     camera["framing_set"] = framings
 
-    rig = ""
-    for signal in report.shots:
-        if signal.motion is not None:
-            from .infer import RIG_BY_MOTION
+    # 机位优先取 CV 的确定性结论；CV 给不出（亮度序列分不清镜头动与
+    # 被摄体动）就退回模型判断。留空是最次的选择 —— 机位是高影响级维度。
+    from .infer import resolve_rig
 
-            rig = RIG_BY_MOTION.get(signal.motion.kind, "")
-            if rig:
-                break
-    camera["rig"] = rig or UNKNOWN
+    by_index = {u.shot_index: u for u in report.understandings}
+    for signal in report.shots:
+        rig, source = resolve_rig(signal.motion, by_index.get(signal.boundary.index))
+        if rig:
+            camera["rig"] = rig
+            camera["transition_logic"] = (
+                f"机位判定来源：{source}"
+                + ("（CV 确定性量测）" if source == "CV" else "（视觉模型语义判断）")
+            )
+            return
+    camera["rig"] = UNKNOWN
 
 
 def _fill_quality(ir: dict, report: InferenceReport) -> None:

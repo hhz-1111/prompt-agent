@@ -322,6 +322,7 @@ ROOT_FIELDS: tuple[FieldSpec, ...] = _SCHEMA
 # 路径寻址
 # --------------------------------------------------------------------------
 _INDEX_SUFFIX = "[]"
+_INDEX_TAIL = __import__("re").compile(r"\[(\d+)\]")
 
 
 def concrete_path(template: str, index: int) -> str:
@@ -592,3 +593,81 @@ def schema_digest() -> list[dict[str, Any]]:
         }
         for spec in FIELDS.values()
     ]
+
+
+# --------------------------------------------------------------------------
+# 级联改写：改一个位置要带动一串引用
+# --------------------------------------------------------------------------
+def cascade_person_rename(ir: IR, index: int, old: str, new: str) -> list[str]:
+    """改人物名时，同步所有以该名字派生的引用。
+
+    **为什么必须级联**：人物名不是孤立字段，它被四处引用 ——
+    音色绑定的说话人、多视图素材的槽位名、占位符文本、台词说话人。
+    只改名字不同步，会造成两种坏结果，实测都踩过：
+
+    1. 交付物自相矛盾：「王姐形象参考[图1]」和「穿紫色连衣裙的女子声音音色参考[音频1]」
+       同时出现，用户不知道为什么冒出个没听过的角色名；
+    2. 闸门误报：G6 发现"王姐缺音色绑定"而阻断，其实音色是有的，
+       只是还挂在旧名字下。
+
+    **按名字匹配而不是按索引**：``B6_audio`` 的顺序来自台词说话人，
+    与 ``B2_person`` 的下标并不保证一致，按下标改是脆的。
+    ``index`` 只用于提示，不参与匹配。
+
+    返回被同步修改的路径列表，便于前端提示"哪些地方跟着变了"。
+    """
+    touched: list[str] = []
+    if not old or not new or old == new:
+        return touched
+
+    for audio_index, track in enumerate(ir.get("locked", {}).get("B6_audio", [])):
+        if str(track.get("speaker") or "") == old:
+            track["speaker"] = new
+            touched.append(f"locked.B6_audio[{audio_index}].speaker")
+        ref = str(track.get("audio_ref") or "")
+        if old in ref:
+            track["audio_ref"] = ref.replace(old, new)
+            touched.append(f"locked.B6_audio[{audio_index}].audio_ref")
+
+    for ref_index, ref in enumerate(ir.get("references", [])):
+        slots = [str(s) for s in ref.get("slots", [])]
+        if any(old in slot for slot in slots):
+            ref["slots"] = [slot.replace(old, new) for slot in slots]
+            touched.append(f"references[{ref_index}].slots")
+        placeholder = str(ref.get("placeholder") or "")
+        if old in placeholder:
+            ref["placeholder"] = placeholder.replace(old, new)
+            touched.append(f"references[{ref_index}].placeholder")
+
+    # **必须同步 multi_view_ref**：它是句柄解析的索引键。
+    # 漏了它会导致 ``形象参考[王姐多视图]`` 解析不出 [图N]，
+    # 退化成字面文本 —— 交付物直接不可用（实测踩过）。
+    for person_index, person in enumerate(ir.get("locked", {}).get("B2_person", [])):
+        ref = str(person.get("multi_view_ref") or "")
+        if old in ref:
+            person["multi_view_ref"] = ref.replace(old, new)
+            touched.append(f"locked.B2_person[{person_index}].multi_view_ref")
+
+    for beat_index, beat in enumerate(ir.get("creative", {}).get("C2_beats", [])):
+        dialogue = beat.get("dialogue") or {}
+        if str(dialogue.get("speaker") or "") == old:
+            dialogue["speaker"] = new
+            touched.append(f"creative.C2_beats[{beat_index}].dialogue.speaker")
+
+    _ = index  # 保留参数以便调用方表达意图，但匹配不依赖它
+    return touched
+
+
+def referenced_by(ir: Mapping[str, Any], path: str) -> list[str]:
+    """反查：改这个位置会影响哪些别的位置。用于 UI 提示。"""
+    spec = spec_for(path)
+    if spec is None or not spec.path.endswith("B2_person[].name"):
+        return []
+    match = _INDEX_TAIL.search(path)
+    if not match:
+        return []
+    index = int(match.group(1))
+    out = [f"locked.B6_audio[{index}].speaker", f"locked.B6_audio[{index}].audio_ref"]
+    out.append("references[].slots / placeholder（按名字匹配）")
+    out.append("creative.C2_beats[].dialogue.speaker（按名字匹配）")
+    return out

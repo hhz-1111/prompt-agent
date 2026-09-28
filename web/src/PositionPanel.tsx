@@ -1,6 +1,13 @@
 import { useMemo, useState } from "react";
 import type { AssembleResponse, Position, PositionColor } from "./api";
-import { confidenceLabel, formatRisk, shortPath } from "./format";
+import {
+  actionableBlueFields,
+  confidenceLabel,
+  displayValue,
+  formatRisk,
+  groupBlueSlots,
+  shortPath,
+} from "./format";
 
 interface Props {
   assembled: AssembleResponse;
@@ -25,11 +32,16 @@ export function PositionPanel({ assembled, onWrite }: Props) {
     () => positions.filter((p) => p.provenance && p.provenance.confidence < 0.7),
     [positions],
   );
+  const blueSlots = useMemo(() => groupBlueSlots(positions), [positions]);
 
   const visible = useMemo(() => {
     let list = positions;
     if (filter !== "all") list = list.filter((p) => p.color === filter);
     if (onlyPending) list = list.filter((p) => p.provenance && p.provenance.confidence < 0.7);
+    // 蓝位在下面按素材分组单独渲染，这里排除，避免同一批字段出现两次
+    if (filter === "blue" || filter === "all") {
+      list = list.filter((p) => p.color !== "blue");
+    }
     return list;
   }, [positions, filter, onlyPending]);
 
@@ -43,6 +55,8 @@ export function PositionPanel({ assembled, onWrite }: Props) {
     }
     return [...map.entries()];
   }, [visible]);
+
+  const showBlue = filter === "all" || filter === "blue";
 
   return (
     <section className="panel">
@@ -75,7 +89,21 @@ export function PositionPanel({ assembled, onWrite }: Props) {
       </p>
 
       <div className="panel__body">
-        {grouped.length === 0 && <p className="muted pad">没有符合条件的位置</p>}
+        {showBlue && blueSlots.length > 0 && (
+          <div className="group">
+            <h4 className="group__title">【参考素材】要换的素材（🔵）</h4>
+            <ul className="manifest">
+              {blueSlots.map((slot) => (
+                <BlueSlotCard key={slot.index} slot={slot} onWrite={onWrite} />
+              ))}
+            </ul>
+            <p className="muted tiny">
+              素材的生成与合规由中台负责，这里只声明「需要哪些」与「绑定哪一个」。
+            </p>
+          </div>
+        )}
+
+        {grouped.length === 0 && !showBlue && <p className="muted pad">没有符合条件的位置</p>}
         {grouped.map(([section, items]) => (
           <div key={section} className="group">
             <h4 className="group__title">【{section}】</h4>
@@ -88,6 +116,75 @@ export function PositionPanel({ assembled, onWrite }: Props) {
         ))}
       </div>
     </section>
+  );
+}
+
+/** 一张素材卡片：把该素材的字段收在一处，并按需给出绑定入口。 */
+function BlueSlotCard({
+  slot,
+  onWrite,
+}: {
+  slot: ReturnType<typeof groupBlueSlots>[number];
+  onWrite: (path: string, value: unknown) => void;
+}) {
+  const assetField = slot.fields.find((f) => f.path.endsWith(".asset_id"));
+  const [handle, setHandle] = useState(() =>
+    assetField ? displayValue(assetField.value) : "",
+  );
+  const bound = Boolean(assetField && displayValue(assetField.value));
+  const typeField = slot.fields.find((f) => f.path.endsWith(".type"));
+
+  return (
+    <li className={`slot-card${bound ? " is-bound" : ""}`}>
+      <div className="slot-card__head">
+        <span className={`dot dot--${bound ? "blue" : "gray"}`} />
+        <strong>{slot.name}</strong>
+        <select
+          className="slot-card__type"
+          value={displayValue(typeField?.value)}
+          disabled={!typeField?.editable}
+          onChange={(e) => typeField && onWrite(typeField.path, e.target.value)}
+        >
+          {(typeField?.choices.length
+            ? typeField.choices
+            : [displayValue(typeField?.value)]
+          ).map((choice) => (
+            <option key={choice} value={choice}>
+              {choice}
+            </option>
+          ))}
+        </select>
+        <span className="chip">{bound ? "已绑定" : "待绑定"}</span>
+      </div>
+      {assetField && (
+        <div className="slot-card__bind">
+          <input
+            value={handle}
+            placeholder="粘贴上游回填的素材句柄"
+            onChange={(e) => setHandle(e.target.value)}
+          />
+          <button
+            className="btn btn--ghost btn--sm"
+            disabled={!handle.trim() || !assetField.editable}
+            onClick={() => onWrite(assetField.path, handle.trim())}
+          >
+            {bound ? "更新绑定" : "绑定"}
+          </button>
+        </div>
+      )}
+      <details className="slot-card__more">
+        <summary>查看该素材的全部字段（{slot.fields.length}）</summary>
+        <ul className="positions">
+          {actionableBlueFields(slot).map((field) => (
+            <li key={field.path} className="pos pos--blue">
+              <span className="pos__label">{field.label}</span>
+              <span className="pos__path mono">{shortPath(field.path)}</span>
+              <div className="pos__value mono">{displayValue(field.value) || "（空）"}</div>
+            </li>
+          ))}
+        </ul>
+      </details>
+    </li>
   );
 }
 
@@ -184,7 +281,9 @@ function PositionRow({
                 setEditing(true);
               }}
             >
-              {stringify(position.value) || <em className="muted">（空，点击填写）</em>}
+              {stringify(position.value) || (
+                <em className="pos__pending">待填 —— 反推未能确定，请按原片填写</em>
+              )}
             </button>
           )
         ) : (
@@ -205,8 +304,5 @@ function PositionRow({
 }
 
 function stringify(value: unknown): string {
-  if (value === null || value === undefined) return "";
-  if (Array.isArray(value)) return value.join("、");
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
+  return displayValue(value);
 }

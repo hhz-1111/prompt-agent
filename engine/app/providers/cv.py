@@ -263,13 +263,40 @@ def blocking_from_boxes(
 # ----------------------------------------------------------------------
 # 运镜：基于逐帧亮度序列
 # ----------------------------------------------------------------------
-# 判据（都是可解释的，不是玄学阈值）：
-#   固定机位   → 帧间变化极小，且无单调趋势
-#   推近/远离  → 画面内容量持续单调变化，亮度趋势单调
-#   横摇/跟拍  → 持续单向变化但非单调（场景在换，整体亮度不一定单调）
-#   手持       → 高频小幅抖动，方向反复
-MOTION_STABLE_MAX = 0.015
-MOTION_TREND_MIN = 0.05
+# **能力边界要说透，这里是本模块最弱的一环。**
+#
+# 全帧亮度均值**无法区分「镜头在动」和「画面里的人在动」**。
+# 实测踩过：一条固定机位教学视频里人物做深蹲、大面积移位，
+# 亮度自然变化，我的算法把被摄体运动误判成了镜头运动 ——
+# 判出 5 处 pan_or_track/push_in/handheld，而模型（正确地）判「固定」。
+#
+# 更早还犯过一次同样的错：阈值按合成色块校准到 0.015，
+# 真实内容永远超不过它。**合成素材上校准的参数套真实内容必然失准。**
+#
+# 所以现在的策略是**保守**：
+#   - 只有变化极小才敢判 ``fixed``（这是最有把握的一类）；
+#   - 明显单调且幅度大才判 ``push_in``；
+#   - 其余一律 ``unknown`` —— 交给视觉模型判断，并如实标注能力边界。
+#
+# 正确做法是**光流分析**（OpenCV 的 ``calcOpticalFlowFarneback`` 或
+# ``DISOpticalFlow``）：光流场能区分"整场一致位移"（镜头摇）与
+# "局部不一致位移"（被摄体动）。那需要安装 opencv-python。
+# 在装上之前，宁可不给结论，也不给错结论（红线 7 的同一精神）。
+MOTION_STABLE_SPAN = 4.0
+"""全片亮度跨度低于此值 → 判定固定机位。
+
+实测：真实固定机位内容跨度 0.6~2.9（人物走动导致）；合成纯色块接近 0。
+阈值取 4.0 留出余量，宁漏判不错判。
+"""
+MOTION_STABLE_MAD = 0.6
+"""帧间亮度平均绝对差低于此值 → 判定固定机位。"""
+MOTION_PUSH_SPAN = 25.0
+"""亮度跨度超过此值且高度单调 → 才敢判推近/拉远。
+
+真实推近会让画面整体亮度大幅单调变化，量级远高于人物走动。
+"""
+MOTION_PUSH_DIRECTION = 0.80
+"""判定推近所需的单调性（方向一致度）。"""
 
 
 def analyze_motion(
@@ -278,24 +305,27 @@ def analyze_motion(
 ) -> MotionEstimate:
     """用镜头区间内的逐帧亮度序列判断运镜。
 
-    只输出能站得住脚的结论：``fixed`` / ``push_in`` / ``pan_or_track`` /
-    ``handheld`` / ``unknown``。区分不了就返回 ``unknown``。
+    **只在有把握时才给结论**，其余返回 ``unknown``：
+
+    - ``fixed``：变化极小，最有把握；
+    - ``push_in``：跨度大且高度单调；
+    - 其余：``unknown``，由视觉模型判断。
+
+    不做 ``handheld`` / ``pan_or_track`` 的判定 —— 亮度序列区分不了它们，
+    硬判就是编数据。
     """
     window = [f for f in frames if shot.start_ms <= int(f.pts_time * 1000) <= shot.end_ms]
-    if len(window) < 5:
+    if len(window) < 8:
         return MotionEstimate(
             kind="unknown",
-            confidence=compute_confidence(
-                ConfidenceBasis.CV, consistency="single", evidence="timecode_only"
-            ),
-            note="镜头内有效帧不足 5 帧，无法做运动估计",
+            confidence=0.0,
+            note=f"镜头内仅 {len(window)} 帧，不足 8 帧，不做运动估计",
         )
 
     lumas = [f.luma for f in window]
     deltas = [b - a for a, b in zip(lumas, lumas[1:])]
     mean_abs = statistics.fmean(abs(d) for d in deltas)
     span = max(lumas) - min(lumas)
-    # 方向一致性：同号比例。1.0 = 完全单调，0.5 = 方向反复
     positives = sum(1 for d in deltas if d > 0)
     direction_ratio = max(positives, len(deltas) - positives) / len(deltas)
 
@@ -303,30 +333,34 @@ def analyze_motion(
         ConfidenceBasis.CV, consistency="single", evidence="timecode_and_frame"
     )
 
-    if mean_abs < MOTION_STABLE_MAX and span < MOTION_TREND_MIN:
+    if span < MOTION_STABLE_SPAN and mean_abs < MOTION_STABLE_MAD:
         return MotionEstimate(
-            kind="fixed", confidence=confidence, magnitude=mean_abs,
-            note=f"帧间亮度变化 {mean_abs:.4f}，全片稳定 → 判定固定机位",
+            kind="fixed",
+            confidence=round(confidence * 0.9, 4),
+            magnitude=mean_abs,
+            note=f"帧间亮度变化 {mean_abs:.3f}、跨度 {span:.2f}，判定固定机位",
         )
-    if span >= MOTION_TREND_MIN and direction_ratio >= 0.75:
+
+    if span >= MOTION_PUSH_SPAN and direction_ratio >= MOTION_PUSH_DIRECTION:
         return MotionEstimate(
             kind="push_in",
-            confidence=round(confidence * 0.8, 4),
-            magnitude=mean_abs,
-            note=f"亮度单调变化（方向一致度 {direction_ratio:.2f}），可能是推近/拉远",
-        )
-    if direction_ratio >= 0.65:
-        return MotionEstimate(
-            kind="pan_or_track",
             confidence=round(confidence * 0.7, 4),
             magnitude=mean_abs,
-            note=f"持续单向变化（方向一致度 {direction_ratio:.2f}），可能是横摇或跟拍",
+            note=f"亮度大幅单调变化（跨度 {span:.1f}、方向一致度 {direction_ratio:.2f}），"
+                 f"判定推近/拉远",
         )
+
+    # 其余交给视觉模型。亮度序列分不清"镜头动"与"被摄体动"，
+    # 硬判会得出错误的运镜档位，而运镜是**高影响级**维度。
     return MotionEstimate(
-        kind="handheld",
-        confidence=round(confidence * 0.6, 4),
+        kind="unknown",
+        confidence=0.0,
         magnitude=mean_abs,
-        note=f"方向反复（方向一致度 {direction_ratio:.2f}），判定为手持抖动",
+        note=(
+            f"亮度序列无法区分镜头运动与被摄体运动"
+            f"（跨度 {span:.2f}、方向一致度 {direction_ratio:.2f}）；"
+            f"改由视觉模型判断。装 opencv-python 可启用光流分析解决这一限制"
+        ),
     )
 
 

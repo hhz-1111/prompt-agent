@@ -13,6 +13,7 @@ G8 是最容易被忽略但最致命的一项：把 30 秒的内容塞进一条 
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -125,10 +126,16 @@ class GateReport:
 # 闸门实现
 # --------------------------------------------------------------------------
 def g1_placeholder_residue(doc: PromptDocument, ir: Mapping[str, Any]) -> GateResult:
-    """G1 ``【】`` 残留 = 0。
+    """G1 ``【】`` 残留 = 0，**并且所有素材引用都解析成了 [图N] 句柄**。
 
     只扫**正文**（不含段落标题）—— 段落标题本身就写作 ``【关键一致性】``，
     那是契约的固定格式，不是未绑定的占位符。
+
+    下面第二项检查是补一个**实测发现的盲区**：人物改名后如果
+    ``multi_view_ref`` 没跟着改，句柄解析会失败、退化成
+    ``形象参考[王姐多视图]`` 这样的字面文本。它既不是 ``【】``，
+    也看不出是错的 —— 但交付物已经废了。所以这里显式检查
+    「正文里出现了形如 [xxx多视图] 的非标准句柄」。
     """
     residues = _find_residues(doc.body_text)
     unbound = [
@@ -136,16 +143,29 @@ def g1_placeholder_residue(doc: PromptDocument, ir: Mapping[str, Any]) -> GateRe
         for ref in ir.get("references", [])
         if not ref.get("asset_id")
     ]
-    if not residues:
-        return GateResult("G1", "【】残留", OK, "残留=0", evidence=())
-    detail = f"残留 {len(residues)} 处：{'、'.join(residues[:5])}"
-    if unbound:
-        detail += f"；未绑定素材 {len(unbound)} 个"
-    return GateResult(
-        "G1", "【】残留", BLOCK, detail,
-        suggestion="完成素材绑定；每个占位符都必须绑定到中台已预处理的真实素材句柄。",
-        evidence=tuple(residues[:8]),
-    )
+    if residues:
+        detail = f"残留 {len(residues)} 处：{'、'.join(residues[:5])}"
+        if unbound:
+            detail += f"；未绑定素材 {len(unbound)} 个"
+        return GateResult(
+            "G1", "【】残留", BLOCK, detail,
+            suggestion="完成素材绑定；每个占位符都必须绑定到中台已预处理的真实素材句柄。",
+            evidence=tuple(residues[:8]),
+        )
+
+    # 未解析的句柄：形如 [xxx] 但不是 [图N]/[视频N]/[音频N]
+    unresolved = _find_unresolved_handles(doc.body_text)
+    if unresolved:
+        return GateResult(
+            "G1", "【】残留", BLOCK,
+            f"{len(unresolved)} 处素材引用未解析成句柄：{'、'.join(unresolved[:5])}",
+            suggestion=(
+                "这些引用没有对应的参考物料。常见原因：改了角色名但素材槽位没同步。"
+                "请确认素材清单里的槽位名与正文里的引用名称一致。"
+            ),
+            evidence=tuple(unresolved[:8]),
+        )
+    return GateResult("G1", "【】残留", OK, "残留=0，素材引用全部解析为句柄")
 
 
 def g2_quota(
@@ -676,6 +696,25 @@ def _find_residues(text: str) -> list[str]:
     import re
 
     return [f"【{m}】" for m in re.findall(r"【([^】]{1,40})】", text)]
+
+
+_LEGAL_HANDLE = re.compile(r"\[(?:图|视频|音频)\d+\]")
+_ANY_BRACKET = re.compile(r"\[([^\]\n]{1,24})\]")
+
+
+def _find_unresolved_handles(text: str) -> list[str]:
+    """找出形如 ``[xxx]`` 但不是 ``[图N]``/``[视频N]``/``[音频N]`` 的引用。
+
+    这类残留说明句柄解析失败了 —— 它比 ``【】`` 更隐蔽，
+    因为看起来"像是"一个正常引用。
+    """
+    out: list[str] = []
+    for match in _ANY_BRACKET.finditer(text):
+        token = match.group(0)
+        if _LEGAL_HANDLE.fullmatch(token):
+            continue
+        out.append(token)
+    return out
 
 
 def _role_cn(key: str) -> str:
