@@ -617,6 +617,48 @@ def g14_constraint_strength(
     )
 
 
+def g15_alignment_resolved(
+    alignment: Mapping[str, Any] | None,
+) -> GateResult | None:
+    """对齐未决门禁（PRD F6.6）。
+
+    **只在用过分绝对齐时装进报告** —— 没用对齐就没有未决状态，
+    不该平白多出一项让用户困惑。所以返回 ``None`` 表示"本项不适用"。
+    """
+    if alignment is None:
+        return None
+    summary = alignment.get("summary") or {}
+    total = int(summary.get("total_slots") or 0)
+    if total == 0:
+        return None
+
+    pending = int(summary.get("pending") or 0)
+    unmatched = int(summary.get("unmatched") or 0)
+    orphans = int(summary.get("orphans") or 0)
+    bound = int(summary.get("bound") or 0)
+
+    problems: list[str] = []
+    if pending:
+        problems.append(f"{pending} 处对齐把握不足待确认")
+    if orphans:
+        problems.append(f"{orphans} 段内容没有位置可放")
+    if problems:
+        return GateResult(
+            "G15", "对齐已确认", BLOCK,
+            "；".join(problems),
+            suggestion=(
+                "逐条确认标黄的对齐结果，或手动调整／标记为仅参考。"
+                "未经确认的对齐不会写进交付物 —— 这是刻意的，"
+                "避免猜测污染提示词。"
+            ),
+        )
+    return GateResult(
+        "G15", "对齐已确认", OK,
+        f"{bound}/{total} 个位置已绑定，无未决项"
+        + (f"，{unmatched} 个位置保留原片结构" if unmatched else ""),
+    )
+
+
 # --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
@@ -626,8 +668,9 @@ def run_gates(
     library: ph.PhraseLibrary | None = None,
     *,
     baseline: Mapping[str, Any] | None = None,
+    alignment: Mapping[str, Any] | None = None,
 ) -> GateReport:
-    """跑完 14 项。顺序与 PRD 表格一致，便于对照。"""
+    """跑完 14 项（用绝对齐时外加 G15）。顺序与 PRD 表格一致，便于对照。"""
     lib = library or ph.load_library()
     report = GateReport()
     report.add(g1_placeholder_residue(doc, ir))
@@ -644,6 +687,10 @@ def run_gates(
     report.add(g12_ref_roles(doc, ir))
     report.add(g13_mandatory_dimensions(doc, ir, lib))
     report.add(g14_constraint_strength(doc, lib))
+    # G15 仅在本次用过内容对齐时出现，避免给不用对齐的用户添噪声
+    extra = g15_alignment_resolved(alignment)
+    if extra is not None:
+        report.add(extra)
     return report
 
 

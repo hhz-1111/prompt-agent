@@ -23,7 +23,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from engine.core import assembler, framework as fw, gates, phrases as ph, positions
+from engine.core import (
+    alignment,
+    assembler,
+    framework as fw,
+    gates,
+    phrases as ph,
+    positions,
+)
 from engine.core.types import OutputForm
 
 from .config import Settings
@@ -48,6 +55,19 @@ class WriteRequest(BaseModel):
 class BindAssetRequest(BaseModel):
     reference_index: int = Field(ge=0)
     asset_id: str = Field(description="上游回填的素材句柄")
+
+
+class AlignmentRequest(BaseModel):
+    content: str = Field(description="用户粘贴的台词稿，支持纯脚本 / 说话人：内容 / 00:03 内容")
+    apply: bool = Field(default=True, description="是否把把握足够的绑定写进提示词")
+    chars_per_sec: float = Field(default=5.0, gt=0, description="语速估算，中文常规 5 字/秒")
+
+
+class ManualAlignRequest(BaseModel):
+    slot_path: str = Field(description="要调整的位置路径")
+    block_index: int | None = Field(default=None, description="绑定的内容块下标；null 表示解绑")
+    content: str | None = Field(default=None, description="直接给内容（忽略 block_index）")
+    speaker: str | None = None
 
 
 class DeliveryRequest(BaseModel):
@@ -367,6 +387,104 @@ def _register_routes(
         return {"ok": True, "delivery": delivery}
 
     # ==================================================================
+    # 内容对齐（PRD F6）
+    # ==================================================================
+    @router.post("/projects/{project_id}/align")
+    def align_content(project_id: str, payload: AlignmentRequest) -> dict[str, Any]:
+        """把用户粘贴的台词稿对齐到各位置。
+
+        默认把**把握足够**的绑定直接写进提示词；标黄的必须用户确认 ——
+        未经确认的猜测不许污染交付物（F6.3 + F6.6）。
+        """
+        project = _require(store, project_id)
+        if not project.ir:
+            raise HTTPException(409, "还没有反推结果")
+
+        blocks = alignment.parse_user_content(payload.content)
+        if not blocks:
+            raise HTTPException(400, "没有解析出任何内容行")
+        slots = alignment.collect_slots(project.ir)
+        report = alignment.align(blocks, slots, chars_per_sec=payload.chars_per_sec)
+
+        written: list[str] = []
+        if payload.apply:
+            written = alignment.apply_alignment(project.ir, report)
+
+        project.report = {**project.report, "alignment": report.to_dict()}
+        store.save(project)
+        return {
+            "report": report.to_dict(),
+            "written": written,
+            "blocks": [b.to_dict() for b in blocks],
+            "slots": [s.to_dict() for s in slots],
+        }
+
+    @router.get("/projects/{project_id}/align")
+    def get_alignment(project_id: str) -> dict[str, Any]:
+        project = _require(store, project_id)
+        stored = (project.report or {}).get("alignment")
+        if stored is None:
+            return {"report": None, "slots": (
+                [s.to_dict() for s in alignment.collect_slots(project.ir)]
+                if project.ir else []
+            )}
+        return {"report": stored, "slots": (
+            [s.to_dict() for s in alignment.collect_slots(project.ir)]
+            if project.ir else []
+        )}
+
+    @router.put("/projects/{project_id}/align/manual")
+    def align_manual(project_id: str, payload: ManualAlignRequest) -> dict[str, Any]:
+        """手动对齐：绑定某一段、或解绑清空（PRD F6.5）。
+
+        解绑后该位置回到"未分配"，交付物里会保留原片结构 ——
+        这是"标为仅参考"的落地方式。
+        """
+        project = _require(store, project_id)
+        if not project.ir:
+            raise HTTPException(409, "还没有反推结果")
+
+        dialogue_path = payload.slot_path
+        if fw.spec_for(f"{dialogue_path}.line") is None:
+            raise HTTPException(404, f"不是可对齐的位置：{payload.slot_path}")
+
+        if payload.content is not None:
+            line, speaker = payload.content, (payload.speaker or "")
+        elif payload.block_index is None:
+            line, speaker = "", ""      # 解绑
+        else:
+            stored = (project.report or {}).get("alignment") or {}
+            bindings = stored.get("bindings") or []
+            block = None
+            for item in bindings:
+                candidate = item.get("block")
+                if candidate and int(candidate.get("index", -1)) == payload.block_index:
+                    block = candidate
+                    break
+            if block is None:
+                raise HTTPException(404, f"对齐结果里没有内容块 {payload.block_index}")
+            line = str(block.get("content") or "")
+            speaker = payload.speaker or str(block.get("speaker") or "")
+
+        fw.set_in(project.ir, f"{dialogue_path}.line", line)
+        if fw.spec_for(f"{dialogue_path}.speaker") is not None:
+            fw.set_in(project.ir, f"{dialogue_path}.speaker", speaker)
+
+        # 手动确认后清掉该位置的未决状态
+        stored = (project.report or {}).get("alignment")
+        if stored:
+            for item in stored.get("bindings") or []:
+                if item.get("slot", {}).get("path") == dialogue_path:
+                    item["status"] = "bound"
+                    item["requires_confirmation"] = False
+                    item["reason"] = "已由用户手动确认"
+            _recount_alignment(stored)
+            project.report = {**project.report, "alignment": stored}
+
+        store.save(project)
+        return {"ok": True, "slot_path": dialogue_path, "line": line, "speaker": speaker}
+
+    # ==================================================================
     # 组装与交付
     # ==================================================================
     @router.get("/projects/{project_id}/assemble")
@@ -376,7 +494,9 @@ def _register_routes(
             raise HTTPException(409, "还没有反推结果")
 
         doc = assembler.assemble(project.ir, library)
-        report = gates.run_gates(project.ir, doc, library)
+        report = gates.run_gates(
+            project.ir, doc, library, alignment=_alignment_of(project)
+        )
 
         warnings = list(doc.warnings)
         warnings.extend(_blocking_hints(project.ir))
@@ -398,7 +518,9 @@ def _register_routes(
         if not project.ir:
             raise HTTPException(409, "还没有反推结果")
         doc = assembler.assemble(project.ir, library)
-        report = gates.run_gates(project.ir, doc, library)
+        report = gates.run_gates(
+            project.ir, doc, library, alignment=_alignment_of(project)
+        )
 
         # 红线 10：闸门未全绿时不许声称可交付，导出时如实带上判定
         header = (
@@ -438,6 +560,32 @@ def _require(store: ProjectStore, project_id: str) -> Project:
     if project is None:
         raise HTTPException(404, "项目不存在")
     return project
+
+def _recount_alignment(stored: dict[str, Any]) -> None:
+    """手动确认后重算汇总 —— 否则门禁还在按旧状态判定。"""
+    bindings = stored.get("bindings") or []
+    bound = sum(1 for b in bindings if b.get("status") == "bound")
+    pending = sum(1 for b in bindings if b.get("status") == "pending")
+    unmatched = sum(1 for b in bindings if b.get("status") == "unmatched")
+    orphans = len(stored.get("orphans") or [])
+    stored["summary"] = {
+        "total_slots": len(bindings),
+        "bound": bound,
+        "pending": pending,
+        "unmatched": unmatched,
+        "orphans": orphans,
+        "has_unresolved": bool(pending or unmatched or orphans),
+    }
+
+
+def _alignment_of(project: Project) -> dict[str, Any] | None:
+    """取出本次项目的对齐结果，供门禁 G15 判定。
+
+    没用过内容对齐就返回 None —— 那样 G15 不会出现在报告里，
+    不给不用对齐的用户添噪声。
+    """
+    return (project.report or {}).get("alignment")
+
 
 def _prov(project: Project) -> dict[str, Any]:
     """把已存的 provenance 还原成对象，供位置表着色与"待确认"统计。

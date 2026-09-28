@@ -103,12 +103,21 @@ CHECKS: list[tuple[str, str, str, str, str]] = [
     ("F5.5", "素材位即时校验", "engine/core/positions.py",
      r"def blue_slot_manifest", "类型/缺失/超额"),
 
-    # ================= F6 内容对齐（未实现） =================
-    ("F6.1", "三种输入形态解析", "", "", "未实现"),
-    ("F6.2", "自动对齐 + 置信度", "", "", "未实现（反推侧只做整段归属）"),
-    ("F6.4", "双向引用位置保留", "", "", "未实现"),
-    ("F6.5", "手动对齐（拖拽/拆分/合并）", "", "", "未实现"),
-    ("F6.6", "强制门禁（未决状态禁入组装）", "", "", "未实现"),
+    # ================= F6 内容对齐 =================
+    ("F6.1", "三种输入形态解析", "engine/core/alignment.py",
+     r"def parse_user_content", "纯脚本 / 说话人：内容 / 00:03 内容"),
+    ("F6.2", "自动对齐 + 置信度（Top-1 ≥80%）", "engine/core/alignment.py",
+     r"def align\(", "三层判据 + 保序动态规划"),
+    ("F6.3", "置信度分级处置（<0.70 必须确认）", "engine/core/alignment.py",
+     r"BIND_THRESHOLD", "低于阈值标黄不写入"),
+    ("F6.4", "双向引用位置保留", "engine/core/alignment.py",
+     r"char_start|def to_dict", "原稿字符区间 + 原片时间码"),
+    ("F6.5", "手动对齐（绑定/解绑）", "engine/app/api.py",
+     r"def align_manual", "绑定某段或标为仅参考"),
+    ("F6.6", "强制门禁（未决禁入组装）", "engine/core/gates.py",
+     r"def g15_alignment_resolved", "G15 条件出现"),
+    ("F6.7", "三列对照表（时间码/原片台词/我的内容/置信度）", "web/src/AlignmentPanel.tsx",
+     r"align__row--head", "前后端联动"),
 
     # ================= F7 模板库与评分（未实现） =================
     ("F7.1", "模板沉淀", "", "", "未实现"),
@@ -138,6 +147,8 @@ CHECKS: list[tuple[str, str, str, str, str]] = [
     ("G12", "素材角色已声明（自动修复）", "engine/core/gates.py", r"def g12_ref_roles", ""),
     ("G13", "必写维度齐全", "engine/core/gates.py", r"def g13_mandatory_dimensions", ""),
     ("G14", "约束强度未降级", "engine/core/gates.py", r"def g14_constraint_strength", ""),
+    ("G15", "对齐已确认（用绝对齐时才出现）", "engine/core/gates.py",
+     r"def g15_alignment_resolved", "F6.6 强制门禁"),
 ]
 
 

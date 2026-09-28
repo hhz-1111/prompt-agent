@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { AlignmentPanel } from "./AlignmentPanel";
 import { DeliveryPanel } from "./DeliveryPanel";
 import { PositionPanel } from "./PositionPanel";
 import { ProjectRail } from "./ProjectRail";
@@ -6,8 +7,11 @@ import { Workbench } from "./Workbench";
 import { api } from "./api";
 import { useAppState } from "./useAppState";
 
+type Tab = "positions" | "alignment";
+
 export default function App() {
   const state = useAppState();
+  const [tab, setTab] = useState<Tab>("positions");
   const activeId = state.project?.project_id ?? null;
   const hasIr = Boolean(state.project?.has_ir);
 
@@ -102,10 +106,33 @@ export default function App() {
               <div className="split">
                 {state.assembled ? (
                   <>
-                    <PositionPanel
-                      assembled={state.assembled}
-                      onWrite={(path, value) => void state.writeField(path, value)}
-                    />
+                    <div className="leftcol">
+                      <nav className="subtabs">
+                        <button
+                          className={tab === "positions" ? "tab is-active" : "tab"}
+                          onClick={() => setTab("positions")}
+                        >
+                          位置标注
+                        </button>
+                        <button
+                          className={tab === "alignment" ? "tab is-active" : "tab"}
+                          onClick={() => setTab("alignment")}
+                        >
+                          内容对齐
+                        </button>
+                      </nav>
+                      {tab === "positions" ? (
+                        <PositionPanel
+                          assembled={state.assembled}
+                          onWrite={(path, value) => void state.writeField(path, value)}
+                        />
+                      ) : (
+                        <AlignmentPanel
+                          projectId={state.project.project_id}
+                          onApplied={() => void state.reloadAssembled()}
+                        />
+                      )}
+                    </div>
                     <DeliveryPanel
                       assembled={state.assembled}
                       project={state.project}

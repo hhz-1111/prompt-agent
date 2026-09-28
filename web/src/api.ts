@@ -210,6 +210,74 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+export interface AlignmentScore {
+  total: number;
+  similarity: number;
+  duration_fit: number;
+  speaker_match: number;
+}
+
+export interface ContentBlock {
+  index: number;
+  content: string;
+  speaker: string;
+  char_start: number;
+  char_end: number;
+  estimated_seconds: number;
+  timecode_hint_sec: number | null;
+}
+
+export interface AlignmentSlot {
+  index: number;
+  path: string;
+  label: string;
+  timecode: string;
+  span: { start_ms: number; end_ms: number };
+  reference_line: string;
+  speaker: string;
+  capacity_chars: number;
+}
+
+export interface AlignmentBinding {
+  slot: AlignmentSlot;
+  block: ContentBlock | null;
+  score: AlignmentScore;
+  confidence: number;
+  status: "bound" | "pending" | "unmatched" | "orphan";
+  requires_confirmation: boolean;
+  reason: string;
+  conflicts: string[];
+}
+
+export interface AlignmentSummary {
+  total_slots: number;
+  bound: number;
+  pending: number;
+  unmatched: number;
+  orphans: number;
+  has_unresolved: boolean;
+}
+
+export interface AlignmentReport {
+  bindings: AlignmentBinding[];
+  orphans: ContentBlock[];
+  chars_per_sec: number;
+  notes: string[];
+  summary: AlignmentSummary;
+}
+
+export interface AlignmentResponse {
+  report: AlignmentReport;
+  written: string[];
+  blocks: ContentBlock[];
+  slots: AlignmentSlot[];
+}
+
+export interface AlignmentState {
+  report: AlignmentReport | null;
+  slots: AlignmentSlot[];
+}
+
 export const api = {
   health: () => request<HealthInfo>("/api/health"),
 
@@ -290,4 +358,22 @@ export const api = {
     `/api/projects/${id}/export?form=${form}`,
 
   videoUrl: (id: string) => `/api/projects/${id}/video`,
+
+  // ---- 内容对齐（PRD F6）----
+  getAlignment: (id: string) => request<AlignmentState>(`/api/projects/${id}/align`),
+
+  align: (id: string, content: string, apply = true, charsPerSec = 5) =>
+    request<AlignmentResponse>(`/api/projects/${id}/align`, {
+      method: "POST",
+      body: JSON.stringify({ content, apply, chars_per_sec: charsPerSec }),
+    }),
+
+  manualAlign: (
+    id: string,
+    payload: { slot_path: string; block_index?: number | null; content?: string; speaker?: string },
+  ) =>
+    request<{ ok: boolean; line: string; speaker: string }>(
+      `/api/projects/${id}/align/manual`,
+      { method: "PUT", body: JSON.stringify(payload) },
+    ),
 };

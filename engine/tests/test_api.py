@@ -217,3 +217,148 @@ class TestRealPipeline:
         assert client.get(
             f"/api/projects/{ready}/export", params={"form": "pdf"}
         ).status_code == 422
+
+
+@pytest.mark.skipif(not VIDEO.exists(), reason="需要 .probe/vid/talk.mp4 测试视频")
+class TestAlignmentFlow:
+    """内容对齐（PRD F6）走 HTTP 层。"""
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def ready(client):
+        project = client.post("/api/projects", json={"name": "对齐流程"}).json()
+        pid = project["project_id"]
+        with VIDEO.open("rb") as handle:
+            assert client.post(
+                f"/api/projects/{pid}/video",
+                files={"file": (VIDEO.name, handle, "video/mp4")},
+            ).status_code == 200
+        assert client.post(f"/api/projects/{pid}/infer").status_code == 202
+        import time
+
+        for _ in range(120):
+            status = client.get(f"/api/projects/{pid}/status").json()
+            if status["status"] in ("ready", "failed"):
+                break
+            time.sleep(1)
+        assert status["status"] == "ready", status
+        return pid
+
+    def test_slots_are_listed_before_alignment(self, client, ready):
+        data = client.get(f"/api/projects/{ready}/align").json()
+        assert data["report"] is None
+        assert data["slots"], "未对齐时也应列出可对齐的位置"
+
+    def test_align_writes_confident_bindings(self, client, ready):
+        """把原片台词原样粘回来 —— 应当全部高置信度绑定。"""
+        slots = client.get(f"/api/projects/{ready}/align").json()["slots"]
+        lines = [s["reference_line"] for s in slots if s["reference_line"]]
+        assert lines, "反推应产出至少一句参考台词"
+
+        response = client.post(
+            f"/api/projects/{ready}/align",
+            json={"content": "\n".join(lines), "apply": True},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["report"]["summary"]["bound"] >= 1
+        assert body["written"], "把握足够的绑定应写进 IR"
+        for binding in body["report"]["bindings"]:
+            if binding["block"] is not None:
+                assert binding["confidence"] >= 0.7
+
+    def test_align_rejects_empty_content(self, client, ready):
+        assert client.post(
+            f"/api/projects/{ready}/align", json={"content": "   \n  \n"}
+        ).status_code == 400
+
+    def test_unresolved_alignment_blocks_gate_g15(self, client, ready):
+        """F6.6 强制门禁：存在未决状态时不允许进入组装。"""
+        response = client.post(
+            f"/api/projects/{ready}/align",
+            json={"content": "甲：今天天气不错\n乙：是啊挺暖和的", "apply": True},
+        )
+        assert response.status_code == 200
+        report = response.json()["report"]
+        if not report["summary"]["has_unresolved"]:
+            pytest.skip("本例未产生未决项")
+
+        assembled = client.get(f"/api/projects/{ready}/assemble").json()
+        codes = [r["code"] for r in assembled["gates"]["results"]]
+        assert "G15" in codes, "用绝对齐后必须出现 G15"
+        g15 = next(r for r in assembled["gates"]["results"] if r["code"] == "G15")
+        assert g15["status"] == "block"
+        assert not assembled["gates"]["deliverable"]
+
+    def test_manual_align_clears_pending(self, client, ready):
+        """手动确认后未决状态应消失（F6.5）。"""
+        slots = client.get(f"/api/projects/{ready}/align").json()["slots"]
+        if not slots:
+            pytest.skip("没有可对齐的位置")
+        target = slots[0]["path"]
+
+        response = client.put(
+            f"/api/projects/{ready}/align/manual",
+            json={"slot_path": target, "content": "手动填写的一句台词", "speaker": "甲"},
+        )
+        assert response.status_code == 200
+        assert response.json()["line"] == "手动填写的一句台词"
+
+        stored = client.get(f"/api/projects/{ready}/align").json()["report"]
+        binding = next(
+            b for b in stored["bindings"] if b["slot"]["path"] == target
+        )
+        assert binding["status"] == "bound"
+        assert not binding["requires_confirmation"]
+        assert binding["reason"] == "已由用户手动确认"
+
+    def test_manual_align_can_unbind(self, client, ready):
+        """解绑 = 标为仅参考，该位置回到保留原片结构。"""
+        slots = client.get(f"/api/projects/{ready}/align").json()["slots"]
+        target = slots[0]["path"]
+        response = client.put(
+            f"/api/projects/{ready}/align/manual",
+            json={"slot_path": target, "block_index": None},
+        )
+        assert response.status_code == 200
+        assert response.json()["line"] == ""
+
+    def test_manual_align_rejects_non_dialogue_path(self, client, ready):
+        response = client.put(
+            f"/api/projects/{ready}/align/manual",
+            json={"slot_path": "locked.B3_blocking", "content": "x"},
+        )
+        assert response.status_code == 404
+
+    def test_aligned_content_reaches_export(self, client, ready):
+        slots = client.get(f"/api/projects/{ready}/align").json()["slots"]
+        target = slots[0]["path"]
+        client.put(
+            f"/api/projects/{ready}/align/manual",
+            json={"slot_path": target, "content": "导出用的测试台词", "speaker": "甲"},
+        )
+        exported = client.get(
+            f"/api/projects/{ready}/export", params={"form": "plain"}
+        ).text
+        assert "导出用的测试台词" in exported
+
+    def test_g15_absent_when_alignment_unused(self, client):
+        """没用过对齐的项目不该平白多出一项闸门。"""
+        project = client.post("/api/projects", json={"name": "未对齐"}).json()
+        pid = project["project_id"]
+        with VIDEO.open("rb") as handle:
+            client.post(
+                f"/api/projects/{pid}/video",
+                files={"file": (VIDEO.name, handle, "video/mp4")},
+            )
+        client.post(f"/api/projects/{pid}/infer")
+        import time
+
+        for _ in range(120):
+            if client.get(f"/api/projects/{pid}/status").json()["status"] in ("ready", "failed"):
+                break
+            time.sleep(1)
+        assembled = client.get(f"/api/projects/{pid}/assemble").json()
+        codes = [r["code"] for r in assembled["gates"]["results"]]
+        assert "G15" not in codes
+        assert codes == [f"G{i}" for i in range(1, 15)]
