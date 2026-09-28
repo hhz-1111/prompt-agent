@@ -15,6 +15,9 @@ app = [
     "uvicorn[standard]>=0.30",
     "python-multipart>=0.0.9",
     "httpx>=0.27",
+    # 镜头切分：自研的全帧均值实现会漏切低对比度切镜（实测 9 秒 5 个切镜检出 0 个）。
+    # 装不上时会自动退回内置的 ffmpeg 逐帧均值实现，不影响启动。
+    "scenedetect>=0.6.4",
 ]
 dev = ["pytest>=8.0"]
 

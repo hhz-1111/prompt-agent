@@ -107,6 +107,18 @@ class Inferencer:
 
         progress("抽取关键帧", 0.40)
         frames = self.probe.extract_keyframes(video_path, shots, str(work / "frames"))
+        lost_frames = getattr(self.probe, "last_frame_failures", [])
+        if lost_frames:
+            degradations.append(
+                f"{len(lost_frames)} 个镜头抽帧失败（多为过短镜头或定位点越界），"
+                f"这些镜头将缺少视觉描述：{'；'.join(lost_frames[:3])}"
+            )
+        if len(frames) < len(shots):
+            # 帧数与镜头数不一致时无法逐镜头对齐，如实降级而不是硬凑
+            degradations.append(
+                f"关键帧数 {len(frames)} 少于镜头数 {len(shots)}，"
+                f"视觉理解将只覆盖抽到帧的镜头"
+            )
 
         transcript: list[TranscriptSegment] = []
         if info.has_audio and self.transcriber is not None:
@@ -118,8 +130,10 @@ class Inferencer:
                 degradations.append(f"语音识别失败，台词留空待用户填写：{exc}")
 
         # ---- 步骤 3：视觉理解 ----
+        # 帧数必须与镜头数一致才能逐镜头标注。不一致时**不硬凑** ——
+        # 错位标注比没有标注更糟，会让用户以为某个镜头的景别就是它旁边那个的。
         understandings: list[ShotUnderstanding] = []
-        if self.visual is not None and frames:
+        if self.visual is not None and frames and len(frames) == len(shots):
             progress("视觉理解", 0.60)
             try:
                 understandings = list(self.visual.describe_shots(frames, shots))
@@ -127,6 +141,11 @@ class Inferencer:
                 degradations.append(f"视觉理解失败，景别/机位降级为 CV 或留空：{exc}")
         elif self.visual is None:
             degradations.append("未配置视觉模型，景别/机位/情绪只能依赖 CV 与留空")
+        elif frames and len(frames) != len(shots):
+            degradations.append(
+                f"关键帧({len(frames)})与镜头({len(shots)})数量不一致，"
+                f"为避免错位标注，本次不做视觉理解"
+            )
 
         # ---- 步骤 4：结构归纳 ----
         semantic: SemanticSummary | None = None
@@ -409,20 +428,33 @@ def build_inferencer(
     *,
     with_llm: bool = True,
 ) -> Inferencer:
-    """按配置组装默认编排器。缺 Key 时自动降级为"无模型"模式。"""
+    """按配置组装默认编排器。
+
+    两处**能力降级**都在这里决定，不在业务代码里散落：
+
+    - 缺 API Key → 无模型模式（仍能跑 L0 技术层）；
+    - 缺 PySceneDetect → 退回 ffmpeg 逐帧均值切分（灵敏度会下降）。
+    """
     from ..providers.mimo_analysis import (
         MimoSemanticInducer,
         MimoTranscriber,
         MimoVisualDescriber,
     )
+    from ..providers.scene_detect import SceneDetectShots
 
     resolved = settings or Settings.load()
     media = FFmpegMedia(resolved)
+
+    detector: ShotDetector = media
+    scene_shots = SceneDetectShots(resolved)
+    if scene_shots.available:
+        detector = scene_shots
+
     use_llm = with_llm and resolved.has_llm
     return Inferencer(
         settings=resolved,
         probe=media,
-        detector=media,
+        detector=detector,
         visual=MimoVisualDescriber(resolved) if use_llm else None,
         semantic=MimoSemanticInducer(resolved) if use_llm else None,
         transcriber=MimoTranscriber(resolved) if use_llm else None,

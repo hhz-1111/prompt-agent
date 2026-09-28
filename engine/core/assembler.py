@@ -445,12 +445,19 @@ def estimate_speech_seconds(text: str, chars_per_sec: float = 5.0) -> float:
 
 
 def effective_duration(ir: Mapping[str, Any]) -> float:
-    """优先用 beats 的时长之和；没有就用 ffprobe 的全片时长。"""
+    """本次生成要覆盖的时长（秒）。
+
+    **``meta.total_duration_sec`` 优先**，因为它既承载 ffprobe 测得的原片时长，
+    也是用户可调的**目标时长**入口。
+
+    为什么不能只加节拍时长：G8 会建议"把目标时长拉到 20 秒"来容纳密集节拍，
+    但如果时长是从节拍算出来的，用户就没有调整入口 —— 那句建议等于空话。
+    取 max(节拍总和, 目标时长) 让"延长目标"立刻生效，同时不会把时长算得比内容还短。
+    """
     beats = ir.get("creative", {}).get("C2_beats", [])
-    total = sum(float(b.get("duration_sec") or 0) for b in beats)
-    if total > 0:
-        return round(total, 2)
-    return float(ir.get("meta", {}).get("total_duration_sec") or 0)
+    beat_total = sum(float(b.get("duration_sec") or 0) for b in beats)
+    target = float(ir.get("meta", {}).get("total_duration_sec") or 0)
+    return round(max(beat_total, target), 2)
 
 
 # --------------------------------------------------------------------------

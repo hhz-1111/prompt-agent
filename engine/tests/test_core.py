@@ -592,6 +592,17 @@ class TestGates:
         result = gates.g8_density(ir)
         assert result.blocking
         assert "0.27" in result.detail
+        # 建议必须给两个方向：减节拍，或延长目标时长
+        assert "拉" in result.suggestion and "合并" in result.suggestion
+
+    def test_g8_target_duration_override_takes_effect(self, lib):
+        """目标时长是用户可以调的 —— 延长它应当立刻让密度达标。"""
+        ir = _sample_ir()
+        for beat in ir["creative"]["C2_beats"]:
+            beat["duration_sec"] = 2.0          # 节拍总和 6 秒
+        ir["meta"]["total_duration_sec"] = 12.0  # 目标拉到 12 秒
+        result = gates.g8_density(ir)
+        assert not result.blocking, result.detail
 
     def test_g8_passes_on_low_density(self, lib):
         ir = _sample_ir()

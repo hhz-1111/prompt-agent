@@ -34,6 +34,8 @@ class FFmpegMedia:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.last_frame_failures: list[str] = []
+        """最近一次抽帧里失败的帧说明。编排层据此记降级，而不是静默丢帧。"""
 
     # ------------------------------------------------------------------
     # 技术解析
@@ -134,24 +136,40 @@ class FFmpegMedia:
 
         用 ``-ss``（输入侧定位）+ 逐帧调用：3 分钟视频的镜头数通常在 30 以内，
         这点进程开销远小于"整段解码再筛帧"的代价，且时间点精确。
+
+        **单帧失败不拖垮整条链路**：定位点超出实际帧位置、编码器抖动等情况
+        会让 ffmpeg 返回非零，但那只是一帧缺失，不该让整次反推失败。
+        失败的帧会被跳过，由调用方按"帧数不足"降级处理。
         """
         directory = Path(out_dir)
         directory.mkdir(parents=True, exist_ok=True)
         out: list[str] = []
+        failures: list[str] = []
         for index, ts in enumerate(timestamps_sec, start=1):
             target = directory / f"frame_{index:03d}.jpg"
-            self._run_text([
-                self.settings.ffmpeg_bin,
-                "-y", "-v", "error",
-                "-ss", f"{max(0.0, ts):.3f}",
-                "-i", path,
-                "-frames:v", "1",
-                "-vf", f"scale={width}:-2",
-                "-q:v", "3",
-                str(target),
-            ])
-            if target.exists():
+            try:
+                self._run_text([
+                    self.settings.ffmpeg_bin,
+                    "-y", "-v", "error",
+                    "-ss", f"{max(0.0, ts):.3f}",
+                    "-i", path,
+                    "-frames:v", "1",
+                    "-vf", f"scale={width}:-2",
+                    "-q:v", "3",
+                    str(target),
+                ])
+            except MediaError as exc:
+                failures.append(f"镜头{index}@{ts:.3f}s：{str(exc)[:60]}")
+                target.unlink(missing_ok=True)
+                continue
+            if target.exists() and target.stat().st_size > 0:
                 out.append(str(target))
+            else:
+                failures.append(f"镜头{index}@{ts:.3f}s：未产出文件")
+        if failures and not out:
+            # 一帧都没抽出来才算真失败 —— 否则降级继续
+            raise MediaError("全部关键帧抽取失败：" + "；".join(failures[:3]))
+        self.last_frame_failures = failures
         return out
 
     def extract_keyframes(

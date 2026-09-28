@@ -360,9 +360,18 @@ def g7_char_budget(
 
 
 def g8_density(ir: Mapping[str, Any]) -> GateResult:
-    """G8 内容量与时长匹配 —— 节拍数 ÷ 时长 ≤ 0.27。"""
+    """G8 内容量与时长匹配 —— 节拍数 ÷ 时长 ≤ 0.27。
+
+    这是**最容易被忽略但最致命**的一项：把 30 秒的内容塞进一条 15 秒提示词，
+    模型必然丢细节 —— 这是"抽卡"的头号原因。
+
+    注意判定的是**目标时长**（``duration``），不一定等于原片时长。
+    原片是 9 秒 5 个快切，用户完全可以把目标时长拉到 20 秒来容纳同样多的节拍。
+    """
     beats = list(ir.get("creative", {}).get("C2_beats", []))
     duration = effective_duration(ir)
+    model = str(ir.get("meta", {}).get("target_model") or "seedance-2.0")
+
     if duration <= 0:
         return GateResult(
             "G8", "内容量匹配", BLOCK,
@@ -375,17 +384,27 @@ def g8_density(ir: Mapping[str, Any]) -> GateResult:
             "没有节拍，无法校验密度",
             suggestion="完成镜头切分与节拍表反推。",
         )
+
     density = len(beats) / duration
-    detail = f"密度 {len(beats)}÷{duration:g}={density:.2f}"
+    per_beat = duration / len(beats)
+    detail = f"密度 {len(beats)}÷{duration:g}={density:.2f}（每节拍 {per_beat:.1f} 秒）"
     if density <= DENSITY_LIMIT:
         return GateResult("G8", "内容量匹配", OK, detail)
+
+    # 给出**两个方向**的可执行方案：减节拍，或延长目标时长。
+    # 只说"拆条"是误导 —— 拆条解决不了"单位时间内节拍过多"。
+    allowed_beats = max(1, int(duration * DENSITY_LIMIT))
+    needed_seconds = round(len(beats) / DENSITY_LIMIT, 1)
+    clip_max = 15.0
+    segments = max(1, -(-int(needed_seconds) // int(clip_max)))
     return GateResult(
         "G8", "内容量匹配", BLOCK,
         f"{detail} > {DENSITY_LIMIT}",
         suggestion=(
-            f"建议拆条：把 {len(beats)} 个节拍按 "
-            f"{int(len(beats) / (DENSITY_LIMIT * max(duration, 1)) ) + 1} 条拆分，"
-            f"或合并相邻节拍。官方边界是 15 秒对应 2~4 个清晰节拍。"
+            f"这 {len(beats)} 个节拍对 {duration:g} 秒来说太密了（每节拍 {per_beat:.1f} 秒）。"
+            f"二选一：① 把目标时长拉到 {needed_seconds:g} 秒（按 {clip_max:g} 秒上限拆成 {segments} 条逐条生成）；"
+            f"② 把节拍合并到 {allowed_beats} 个以内。"
+            f"原片快切不等于要逐镜复刻 —— 保住钩子与收尾，中间可以合并。"
         ),
     )
 

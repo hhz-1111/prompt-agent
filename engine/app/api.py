@@ -131,6 +131,7 @@ def _register_routes(
     @router.get("/health")
     def health() -> dict[str, Any]:
         from .providers.cv import detect_capabilities
+        from .providers.scene_detect import SceneDetectShots
 
         return {
             "ok": True,
@@ -138,6 +139,9 @@ def _register_routes(
             "phrase_lib_version": library.version,
             "capabilities": settings.capability_report(),
             "cv": detect_capabilities().to_dict(),
+            "shot_detector": (
+                "scenedetect" if SceneDetectShots(settings).available else "ffmpeg-mean"
+            ),
         }
 
     @router.get("/schema")

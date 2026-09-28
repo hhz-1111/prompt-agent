@@ -271,6 +271,87 @@ class TestCvLayer:
         assert not _camera_agrees("手持", "push_in")
 
 
+class TestShotBoundaryBuilding:
+    """PySceneDetect 切点 → 连续镜头区间。"""
+
+    def test_covers_whole_clip(self):
+        from engine.app.providers.scene_detect import build_boundaries
+
+        shots = build_boundaries([3000, 6000], 9.0)
+        assert [(s.start_ms, s.end_ms) for s in shots] == [
+            (0, 3000), (3000, 6000), (6000, 9000),
+        ]
+        assert [s.index for s in shots] == [1, 2, 3]
+
+    def test_drops_edge_jitter(self):
+        from engine.app.providers.scene_detect import build_boundaries
+
+        shots = build_boundaries([30, 5000], 9.0)
+        assert len(shots) == 2
+        assert shots[0].start_ms == 0
+
+    def test_merges_cuts_too_close_together(self):
+        """一段渐变会被判成多次切点，必须按最小间距合并。"""
+        from engine.app.providers.scene_detect import build_boundaries
+
+        shots = build_boundaries([3000, 3100, 3200, 6000], 9.0, min_gap_ms=300)
+        assert [(s.start_ms, s.end_ms) for s in shots] == [
+            (0, 3000), (3000, 6000), (6000, 9000),
+        ]
+
+    def test_dedupes_and_sorts(self):
+        from engine.app.providers.scene_detect import build_boundaries
+
+        shots = build_boundaries([6000, 3000, 6000, 3000], 9.0)
+        assert len(shots) == 3
+
+    def test_empty_cuts_gives_single_shot(self):
+        from engine.app.providers.scene_detect import build_boundaries
+
+        shots = build_boundaries([], 12.5)
+        assert len(shots) == 1
+        assert shots[0].end_ms == 12500
+
+    def test_tail_sliver_merges_into_previous_shot(self):
+        """视频末尾常被切出几百毫秒的残留镜头。
+
+        实测踩过：一条视频切出 11917-12097ms（180ms）的尾巴，
+        抽帧时 `-ss 12.007s` 落到实际帧位置之外，让 ffmpeg 报错、
+        整条反推失败。碎片镜头必须并入前一镜。
+        """
+        from engine.app.providers.scene_detect import build_boundaries
+
+        shots = build_boundaries([6417, 10417, 11917], 12.097)
+        assert [(s.start_ms, s.end_ms) for s in shots] == [
+            (0, 6417), (6417, 10417), (10417, 12097),
+        ]
+        assert all(s.duration_sec >= 0.25 for s in shots[1:])
+
+    def test_all_shots_are_non_degenerate(self):
+        from engine.app.providers.scene_detect import build_boundaries
+
+        shots = build_boundaries([100, 200, 5000, 11950], 12.0, min_gap_ms=300)
+        assert all(s.end_ms > s.start_ms for s in shots)
+        assert [s.index for s in shots] == list(range(1, len(shots) + 1))
+
+
+class TestSceneDetectAdapter:
+    def test_availability_probe_does_not_raise(self):
+        from engine.app.providers.scene_detect import SceneDetectShots
+
+        assert isinstance(SceneDetectShots(Settings()).available, bool)
+
+    def test_build_inferencer_prefers_scenedetect(self):
+        """装了 PySceneDetect 就该用它的检测器，而不是自研的均值实现。"""
+        from engine.app.providers.scene_detect import SceneDetectShots
+
+        inferencer = build_inferencer(Settings(mimo_api_key=""))
+        if SceneDetectShots(Settings()).available:
+            assert type(inferencer.detector).__name__ == "SceneDetectShots"
+        else:
+            assert type(inferencer.detector).__name__ == "FFmpegMedia"
+
+
 class TestShotModeReconciliation:
     """切分数是 CV 算出来的确定事实，模型没有推翻它的依据。
 
