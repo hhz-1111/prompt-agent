@@ -114,6 +114,16 @@ def _fill_scene(ir: dict, report: InferenceReport) -> None:
     ir["locked"]["B1_scene"]["cross_shot_consistency"] = True
 
 
+# 复刻场景里"人物"的上限。
+# 超过这个数的多半是模型把群体（学员/观众/顾客）当成了独立个体 ——
+# 实测有一条带练视频被抽出 10 个"人物"，于是生成 10 张多视图，
+# 直接撞爆 Seedance 2.0 的 9 张图配额（G2 阻断）。
+MAX_REVERSE_ENGINEERED_PERSONS = 4
+
+# 群体词：出现这些的"人物"标签应视为群体，不进人物清单（PRD D2 群体防细化）
+_GROUP_WORDS = ("观众", "学员", "顾客", "路人", "人群", "大家", "其他人", "群众", "粉丝")
+
+
 def _fill_persons(ir: dict, report: InferenceReport) -> None:
     """人物清单：有几个人、叫什么。
 
@@ -122,7 +132,9 @@ def _fill_persons(ir: dict, report: InferenceReport) -> None:
     1. **ASR 说话人**（``说话人：内容`` 或声纹分离）—— 这是"谁在说"的直接证据；
     2. **视觉模型的人物标签**（如"左侧女子"）—— 只能区分形象，不知道名字。
 
-    两路都拿不到就留空等用户补，**绝不编角色名**（红线 5：不臆造人物信息）。
+    **群体标签会被过滤掉**：``台下观众``、``8名学员`` 是群体不是个体，
+    给群体建多视图既浪费配额又违反 D2 群体防细化。
+    两路都拿不到就留空等用户补，绝不编角色名（红线 5）。
     """
     people: list[str] = []
     for segment in report.transcript:
@@ -130,8 +142,12 @@ def _fill_persons(ir: dict, report: InferenceReport) -> None:
             people.append(segment.speaker)
     for understanding in report.understandings:
         for name in understanding.people:
-            if name and name not in people:
-                people.append(name)
+            cleaned = _text(name)
+            if not cleaned or cleaned in people:
+                continue
+            if any(word in cleaned for word in _GROUP_WORDS):
+                continue
+            people.append(cleaned)
 
     blink = BLINK_BY_GENRE.get(
         report.semantic.genre if report.semantic else Genre.DIALOGUE,
@@ -149,8 +165,25 @@ def _fill_persons(ir: dict, report: InferenceReport) -> None:
             "skin": "brief",
             "blink": blink.value,
         }
-        for name in people
+        for name in people[:MAX_REVERSE_ENGINEERED_PERSONS]
     ]
+
+
+def person_overflow_note(report: InferenceReport) -> str:
+    """人物数超上限时的说明 —— 由调用方放进 degradations，如实告知。"""
+    names: list[str] = []
+    for understanding in report.understandings:
+        for name in understanding.people:
+            cleaned = _text(name)
+            if cleaned and cleaned not in names:
+                names.append(cleaned)
+    if len(names) <= MAX_REVERSE_ENGINEERED_PERSONS:
+        return ""
+    return (
+        f"识别到 {len(names)} 个人物标签，已截取前 {MAX_REVERSE_ENGINEERED_PERSONS} 个"
+        f"（其余可能是群体或次要人物）：{'、'.join(names[MAX_REVERSE_ENGINEERED_PERSONS:])}。"
+        f"请按实际需要增删角色，每多一个角色就多占一张参考图配额。"
+    )
 
 
 def _fill_camera(ir: dict, report: InferenceReport) -> None:
@@ -315,10 +348,37 @@ def _fill_logline(ir: dict, report: InferenceReport) -> None:
 
 
 def _fill_audio(ir: dict, report: InferenceReport) -> None:
+    """音色绑定清单。
+
+    说话人有三路来源，必须**都收进来**：
+
+    1. ASR 返回的说话人（声纹分离或 ``说话人：内容`` 格式）；
+    2. 台词里已经落地的说话人 —— 包括"全片只有一个人物"时推导出来的那个。
+       漏掉这一路会导致：台词有说话人、音色列表却是空的，
+       闸门 G6 阻断、G13 缺音色维度、素材清单也少了音频素材；
+    3. 没有任何台词时，为已识别的人物预留音色位（有角色就可能要配音）。
+    """
     speakers: list[str] = []
     for segment in report.transcript:
         if segment.speaker and segment.speaker not in speakers:
             speakers.append(segment.speaker)
+
+    for beat in ir.get("creative", {}).get("C2_beats", []):
+        dialogue = beat.get("dialogue") or {}
+        speaker = str(dialogue.get("speaker") or "").strip()
+        if str(dialogue.get("line") or "").strip() and speaker and speaker not in speakers:
+            speakers.append(speaker)
+
+    has_dialogue = any(
+        str((b.get("dialogue") or {}).get("line") or "").strip()
+        for b in ir.get("creative", {}).get("C2_beats", [])
+    )
+    if not speakers and not has_dialogue:
+        for person in ir.get("locked", {}).get("B2_person", []):
+            name = str(person.get("name") or "").strip()
+            if name:
+                speakers.append(name)
+
     ir["locked"]["B6_audio"] = [
         {"speaker": name, "audio_ref": f"{name}音频", "volume_mode": "normal"}
         for name in speakers

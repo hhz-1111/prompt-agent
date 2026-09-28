@@ -5,9 +5,16 @@
     组装器只做「把 IR 变成提示词文本」这一件事。
     它不判断能不能交付 —— 那是闸门的事。
 
-组装输出里带 ``PromptSection.sources``：每个段落由哪些位置决定。
-这是框架 §10.3「应用位置」的落地 —— 用户改了某个槽位，
-系统能准确回答"输出提示词的第几段会变"，反之亦然。
+三件容易被做错、这里刻意做对的事：
+
+1. **压缩不是可选项。** 500 字上限 vs 正文常超 800 字是 PRD 明列的风险，
+   所以 ``compress`` 不只给建议，而是**真的执行** PRD §9.2 的丢弃优先级，
+   并把每一步记为 ``CompressionEntry`` —— 红线 4 禁止静默裁剪。
+2. **永不可裁的内容有硬保护。** 站位、音色、台词原文、D0、D7
+   在压缩阶段被显式跳过，任何改写都不会碰到它们。
+3. **每段带 sources。** ``PromptSection.sources`` 记录该段由哪些位置决定，
+   这是框架 §10.3「应用位置」的落地：改了某个槽位，
+   系统能准确回答"输出提示词的第几段会变"。
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ def _is_cjk(ch: str) -> bool:
         or 0xF900 <= code <= 0xFAFF   # 兼容汉字
     )
 
+
 # 参数声明（Phase 1 手动复制模式保留；Phase 2 移除）
 PARAM_HEADER_TEMPLATE = "{ratio} 竖屏，{duration} 秒，{resolution}，生成同步音频。"
 
@@ -50,13 +58,21 @@ PARAM_HEADER_TEMPLATE = "{ratio} 竖屏，{duration} 秒，{resolution}，生成
 LIPSYNC_SENTENCE = "所有对白保持自然停顿和情绪起伏，口型与台词同步。"
 DIALOGUE_PREFIX = "口型要求：中文普通话，语速中等，吐字清晰。"
 
+# 人物一致性的长尾展开段。
+# 框架 §9.2 明确它可在超预算时丢弃，只保留
+# 「{角色}形象参考[图N]」+「锁定人物五官脸型」两句 —— 这两句才是硬约束。
+PERSON_LONGTAIL_RE = _re.compile(
+    r"，用于[^。]{0,120}?(?:气质参考|视觉辨识度|自然真实质感)[^。]{0,40}?。"
+)
+PERSON_LONGTAIL_TEXT = "用于…的五官细节、面部轮廓、外貌、发型、体态和气质参考"
+
 ROLE_OF_REF: Mapping[RefType, SeedanceRole] = {
     RefType.MULTI_VIEW: SeedanceRole.IMAGE,
     RefType.SCENE: SeedanceRole.IMAGE,
     RefType.BLOCKING: SeedanceRole.IMAGE,
     RefType.POSE_SHEET: SeedanceRole.IMAGE,
-    RefType.VIDEO: SeedanceRole.VIDEO,
     RefType.AUDIO: SeedanceRole.AUDIO,
+    RefType.VIDEO: SeedanceRole.VIDEO,
 }
 
 SEEDANCE_ROLE_LABEL: Mapping[SeedanceRole, str] = {
@@ -156,6 +172,7 @@ class PromptDocument:
     compression: list[CompressionEntry] = field(default_factory=list)
     strategy: SplitStrategy = SplitStrategy.S1_ONE_TAKE
     warnings: list[str] = field(default_factory=list)
+    budget: int = 500
 
     # ---- 文本视图 ----
     def full_text(self, *, include_header: bool = True) -> str:
@@ -188,6 +205,11 @@ class PromptDocument:
     def total_char_count(self) -> int:
         """含英文与标点的总字符数（去掉空白）。用于体检与展示。"""
         return sum(1 for ch in self.body_text if not ch.isspace())
+
+    @property
+    def over_budget(self) -> int:
+        """超出预算的中文字数；未超为 0。"""
+        return max(0, self.char_count - self.budget)
 
     def section(self, title: str) -> PromptSection | None:
         for item in self.sections:
@@ -240,6 +262,9 @@ class PromptDocument:
             "strategy": self.strategy.value,
             "param_header": self.param_header,
             "char_count": self.char_count,
+            "total_char_count": self.total_char_count,
+            "budget": self.budget,
+            "over_budget": self.over_budget,
             "sections": [section.to_dict() for section in self.sections],
             "plan": [seg.to_dict() for seg in self.plan],
             "compression": [entry.to_dict() for entry in self.compression],
@@ -443,7 +468,6 @@ def _render_person(
     ir: Mapping[str, Any],
     handles: HandleResolver,
     library: ph.PhraseLibrary,
-    drops: list[CompressionEntry],
 ) -> list[str]:
     lines: list[str] = []
     for person in ir.get("locked", {}).get("B2_person", []):
@@ -494,6 +518,7 @@ def _blink_text(library: ph.PhraseLibrary, key: str) -> str:
 
 
 def _render_blocking(ir: Mapping[str, Any]) -> list[str]:
+    """站位渲染。**永不可裁**（框架 §9.2）。"""
     blocking = ir.get("locked", {}).get("B3_blocking", {})
     lines: list[str] = []
     positions = blocking.get("positions") or []
@@ -520,24 +545,25 @@ def _render_camera(ir: Mapping[str, Any]) -> list[str]:
 def _render_quality(
     ir: Mapping[str, Any],
     library: ph.PhraseLibrary,
-    drops: list[CompressionEntry],
+    *,
+    include_preset_text: bool = True,
 ) -> list[str]:
     quality = ir.get("locked", {}).get("B5_quality", {})
     lines: list[str] = []
     grain = str(quality.get("grain") or "").strip()
     if grain:
         lines.append(grain)
-    preset = str(quality.get("preset") or "")
-    variant = ""
-    template = library.templates.get("T-QUALITY")
-    if template and template.variants:
-        variant = template.variants.get(preset, "")
-    if variant:
-        lines.append(f"画质：{variant}。")
+    if include_preset_text:
+        preset = str(quality.get("preset") or "")
+        template = library.templates.get("T-QUALITY")
+        variant = template.variants.get(preset, "") if template and template.variants else ""
+        if variant:
+            lines.append(f"画质：{variant}。")
     return lines
 
 
 def _render_audio(ir: Mapping[str, Any], handles: HandleResolver) -> list[str]:
+    """音色渲染。**永不可裁**（框架 §9.2）。"""
     lines: list[str] = []
     for track in ir.get("locked", {}).get("B6_audio", []):
         speaker = str(track.get("speaker") or "").strip()
@@ -555,10 +581,11 @@ def _render_audio(ir: Mapping[str, Any], handles: HandleResolver) -> list[str]:
 # --------------------------------------------------------------------------
 # 创作区渲染
 # --------------------------------------------------------------------------
-def _render_beats(ir: Mapping[str, Any]) -> list[str]:
+def _render_beats(ir: Mapping[str, Any], *, max_body_chars: int = 0) -> list[str]:
     """按 shot_mode 决定写法：一镜到底用时间戳分段，多镜头用「镜头N：」。
 
-    两种写法都来自原文规范（框架 §4 C2 写法甲 / 写法乙）。
+    ``max_body_chars`` > 0 时截断单条节拍的动作描述 —— 模型对场景的散文式
+    描写常常上百字，而节拍需要的是**动作**。截断点选在句子边界，不切半句。
     """
     shot_mode = str(ir.get("meta", {}).get("shot_mode") or "one_take")
     lines: list[str] = []
@@ -572,6 +599,9 @@ def _render_beats(ir: Mapping[str, Any]) -> list[str]:
         blocking = str(beat.get("blocking") or "").strip()
         expression = str(beat.get("expression") or "").strip()
         emotion = str(beat.get("emotion") or "").strip()
+
+        if max_body_chars:
+            blocking = _truncate_at_sentence(blocking, max_body_chars)
 
         head = "".join(p for p in (framing, camera) if p and p != UNKNOWN)
         if location:
@@ -597,6 +627,18 @@ def _render_beats(ir: Mapping[str, Any]) -> list[str]:
             continue
         lines.append(f"{prefix}{body}。")
     return lines
+
+
+def _truncate_at_sentence(text: str, limit: int) -> str:
+    """在句子边界截断，绝不留半句话。"""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    for mark in "。；！？，、":
+        index = head.rfind(mark)
+        if index > limit * 0.5:
+            return head[: index + 1].rstrip("，、")
+    return head
 
 
 def _text_or_empty(value: str) -> str:
@@ -628,22 +670,25 @@ def _render_dialogue(ir: Mapping[str, Any]) -> list[str]:
     return [DIALOGUE_PREFIX] + lines + [LIPSYNC_SENTENCE]
 
 
-def _render_forbidden(ir: Mapping[str, Any]) -> list[str]:
+def _render_forbidden(
+    ir: Mapping[str, Any],
+    *,
+    drop_groups: frozenset[str] = frozenset(),
+) -> list[str]:
     return [
         str(item.get("text") or "").strip()
         for item in ir.get("forbidden", [])
         if str(item.get("text") or "").strip()
+        and str(item.get("group") or "") not in drop_groups
     ]
 
 
 def _replace_placeholders(text: str, handles: HandleResolver) -> str:
     """解析期把 ``【xxx】`` 换成 ``[图N]``（框架 §2.1 两步转换的第二步）。"""
-    import re
-
-    def swap(match: "re.Match[str]") -> str:
+    def swap(match: "_re.Match[str]") -> str:
         return handles.token_for(match.group(1), fallback=match.group(0))
 
-    return re.sub(r"【([^】]{1,24})】", swap, text)
+    return _re.sub(r"【([^】]{1,24})】", swap, text)
 
 
 _DECLARED_TOKEN_RE = _re.compile(r"\[(?:图|视频|音频)\d+\]")
@@ -682,7 +727,6 @@ def plan_split(
     durations = [float(b.get("duration_sec") or 0) for b in beats]
     total = sum(durations)
     issues: list[SplitIssue] = []
-    plans: list[SegmentPlan] = []
 
     for index, beat in enumerate(beats, start=1):
         duration = float(beat.get("duration_sec") or 0)
@@ -705,11 +749,10 @@ def plan_split(
                        f"B3 站位与 B4 机位逐字复用。",
         ))
     elif total > clip_max:
-        segment_count = _ceil_div(total, clip_max)
         issues.append(SplitIssue(
             code="SPLIT-NEEDS-SPLIT",
             severity="warn",
-            title=f"全片 {total:g} 秒，需拆成 {segment_count} 条",
+            title=f"全片 {total:g} 秒，需拆成 {_ceil_div(total, clip_max)} 条",
             detail=f"{strategy.value} 策略下每条不超过 {clip_max} 秒。",
             suggestion="锁定位与禁止项在拆条时逐字复用，避免跨条人物/站位漂移。",
         ))
@@ -717,17 +760,20 @@ def plan_split(
     # 密度：节拍数 ÷ 时长 ≤ 0.27（G8 的算法，这里提前算出来供 UI 预警）
     if total > 0 and beats:
         density = len(beats) / total
-        if density > 0.27:
+        if density > DENSITY_LIMIT:
             issues.append(SplitIssue(
                 code="SPLIT-DENSITY",
                 severity="block",
-                title=f"内容密度超标：{len(beats)} 节拍 ÷ {total:g} 秒 = {density:.2f} > 0.27",
+                title=f"内容密度超标：{len(beats)} 节拍 ÷ {total:g} 秒 = {density:.2f} > {DENSITY_LIMIT}",
                 detail="官方边界：15 秒对应 2~4 个清晰节拍。塞太多节拍模型必然忽略细节。",
                 suggestion="合并节拍或拆条。",
             ))
 
-    plans = _build_segments(beats, strategy, clip_max)
-    return plans, issues
+    return _build_segments(beats, strategy, clip_max), issues
+
+
+# 密度上限（G8）：官方边界 —— 15 秒对应 2~4 个清晰节拍
+DENSITY_LIMIT = 0.27
 
 
 def _resolve_strategy(requested: str, shot_mode: str) -> SplitStrategy:
@@ -800,14 +846,26 @@ def _ceil_div(value: float, divisor: float) -> int:
 # --------------------------------------------------------------------------
 # 压缩（框架 §9.2）
 # --------------------------------------------------------------------------
-# 顺序即丢弃优先级：从先丢到后丢。**永不可裁**的项不在表内。
-COMPRESSION_ORDER: tuple[str, ...] = (
-    "B5_quality.grain",
-    "B2_person.expansion",
-    "forbidden.low_freq",
-    "C2.emotion",
-    "B4.movement",
+# 丢弃顺序即优先级：从先丢到后丢。
+# **永不可裁**（框架 §9.2 明文）：B3 站位/视线/遮挡、B6 音色参考、
+# C3 台词原文、D0 通用底线、D7 对白锁定。它们不在下表里，也没有任何代码路径能删它们。
+COMPRESSION_STEPS: tuple[str, ...] = (
+    "quality_preset_text",   # ① B5 次要画质描述：保留预设名，丢弃展开句
+    "person_longtail",       # ② B2 人物长尾：保留「参考[图N]锁定五官脸型」
+    "forbidden_low_freq",    # ③ D 区低频条目（D5/D6）
+    "beat_body_truncate",    # ④ C2 节拍里的散文式场景描写
 )
+
+
+@dataclass(slots=True)
+class _CompressionPlan:
+    """一次压缩的完整决策。组装器据此渲染，而不是渲染完再改文本 —— 后者容易漏改。"""
+
+    quality_preset_text: bool = True
+    person_longtail: bool = True
+    forbidden_low_freq: bool = True
+    beat_body_limit: int = 0
+    entries: list[CompressionEntry] = field(default_factory=list)
 
 
 def compress(
@@ -815,54 +873,123 @@ def compress(
     library: ph.PhraseLibrary,
     *,
     budget: int | None = None,
-) -> list[CompressionEntry]:
-    """字数预算压缩建议。返回**记录**，绝不静默裁剪（红线 4）。
+) -> _CompressionPlan:
+    """按 PRD §9.2 的优先级**真正执行**压缩，直到落入预算。
 
-    真正的裁剪由调用方按记录执行；组装器本身不擅自丢内容。
+    与"只给建议"的区别：这里返回的是**渲染计划**，
+    组装器直接按计划渲染，所以交付物确实变短了。
+
+    压缩不会触碰永不可裁的内容 —— 站位、音色、台词、D0、D7
+    都不在可压缩集合里。裁不掉的部分会如实留在 ``entries`` 里报告。
     """
     model = str(ir.get("meta", {}).get("target_model") or "seedance-2.0")
     limit = budget if budget is not None else int(library.capacity_for(model)["prompt_char_budget"])
-    entries: list[CompressionEntry] = []
 
-    quality = ir.get("locked", {}).get("B5_quality", {})
-    if str(quality.get("grain") or "").strip():
-        entries.append(CompressionEntry(
+    plan = _CompressionPlan()
+    # 先渲染"不压缩"版本，量出真实字数再决定压到哪一步
+    baseline = _render_full(ir, library, plan).char_count
+    if baseline <= limit:
+        return plan
+
+    for step in COMPRESSION_STEPS:
+        running = _render_full(ir, library, plan).char_count
+        if running <= limit:
+            break
+        before = running
+        entry = _apply_step(step, ir, library, plan)
+        if entry is None:
+            continue
+        after = _render_full(ir, library, plan).char_count
+        # 记录真实节省量，而不是估算 —— 估算会让用户无法判断压得够不够
+        plan.entries.append(replace_saved(entry, before - after))
+
+    return plan
+
+
+def replace_saved(entry: CompressionEntry, saved: int) -> CompressionEntry:
+    return CompressionEntry(
+        section=entry.section,
+        what=entry.what,
+        reason=entry.reason,
+        saved_chars=max(0, saved),
+    )
+
+
+def _apply_step(
+    step: str,
+    ir: Mapping[str, Any],
+    library: ph.PhraseLibrary,
+    plan: _CompressionPlan,
+) -> CompressionEntry | None:
+    if step == "quality_preset_text" and plan.quality_preset_text:
+        preset = str(ir.get("locked", {}).get("B5_quality", {}).get("preset") or "")
+        template = library.templates.get("T-QUALITY")
+        variant = template.variants.get(preset, "") if template and template.variants else ""
+        if not variant:
+            return None
+        plan.quality_preset_text = False
+        return CompressionEntry(
             section="关键一致性",
-            what="画质预设的展开描述",
-            reason=f"超出 {limit} 字预算时，先丢弃次要画质描述，保留预设名",
-            saved_chars=len(str(quality["grain"])),
-        ))
+            what=f"画质预设 {preset} 的展开描述",
+            reason="保留预设档位名，丢弃展开句（框架 §9.2 优先级①）",
+            saved_chars=0,
+        )
 
-    persons = ir.get("locked", {}).get("B2_person", [])
-    if persons:
-        entries.append(CompressionEntry(
+    if step == "person_longtail" and plan.person_longtail:
+        if not ir.get("locked", {}).get("B2_person"):
+            return None
+        plan.person_longtail = False
+        return CompressionEntry(
             section="关键一致性",
-            what="人物一致性的长尾展开（「用于…的五官细节、面部轮廓…」）",
-            reason="保留「参考[图N]锁定五官脸型」，丢弃长尾描述",
-            saved_chars=sum(18 for _ in persons),
-        ))
+            what=PERSON_LONGTAIL_TEXT,
+            reason="保留「参考[图N]锁定五官脸型」，丢弃长尾（框架 §9.2 优先级②）",
+            saved_chars=0,
+        )
 
-    for group in ("D5", "D6"):
-        items = [f for f in ir.get("forbidden", []) if str(f.get("group")) == group]
-        if items:
-            entries.append(CompressionEntry(
-                section="禁止项",
-                what=f"{group} 低频禁止条目（{len(items)} 条）",
-                reason="低频条目可在超预算时丢弃",
-                saved_chars=sum(len(str(i.get("text") or "")) for i in items),
-            ))
+    if step == "forbidden_low_freq" and plan.forbidden_low_freq:
+        groups = {
+            str(item.get("group") or "")
+            for item in ir.get("forbidden", [])
+            if str(item.get("group") or "") in _DROPPABLE_FORBIDDEN_GROUPS
+        }
+        if not groups:
+            return None
+        plan.forbidden_low_freq = False
+        return CompressionEntry(
+            section="禁止项",
+            what=f"{'、'.join(sorted(groups))} 低频禁止条目",
+            reason="低频条目可在超预算时丢弃（框架 §9.2 优先级③）；D0/D7 永不可裁",
+            saved_chars=0,
+        )
 
-    beats = ir.get("creative", {}).get("C2_beats", [])
-    emotions = [b for b in beats if str(b.get("emotion") or "").strip()]
-    if emotions:
-        entries.append(CompressionEntry(
+    if step == "beat_body_truncate" and plan.beat_body_limit == 0:
+        if not ir.get("creative", {}).get("C2_beats"):
+            return None
+        plan.beat_body_limit = 60
+        return CompressionEntry(
             section="镜头节拍",
-            what="emotion 情绪标签",
-            reason="合并进 blocking 描述",
-            saved_chars=sum(len(str(b["emotion"])) for b in emotions),
-        ))
+            what="节拍里散文式的场景描写（截断至 60 字，句子边界处断开）",
+            reason="节拍需要的是动作，不是环境散文；截断不影响表演约束",
+            saved_chars=0,
+        )
 
-    return entries
+    return None
+
+
+_DROPPABLE_FORBIDDEN_GROUPS: frozenset[str] = frozenset({"D5", "D6"})
+"""可在超预算时丢弃的禁止项组。
+
+**D0 与 D7 永不在此列** —— 框架 §9.2 明确它们是永不可裁项。
+"""
+
+
+def _render_full(
+    ir: Mapping[str, Any],
+    library: ph.PhraseLibrary,
+    plan: _CompressionPlan,
+) -> PromptDocument:
+    """按给定压缩计划渲染一次，用于量预算。"""
+    return _build_document(ir, library, plan, with_param_header=False)
 
 
 # --------------------------------------------------------------------------
@@ -874,14 +1001,24 @@ def assemble(
     *,
     form: OutputForm = OutputForm.PLAIN,
     with_param_header: bool | None = None,
+    budget: int | None = None,
+    compress_to_budget: bool = True,
 ) -> PromptDocument:
-    """把 IR 组装成一份可直接投喂的提示词。"""
-    lib = library or ph.load_library()
-    handles = HandleResolver(ir)
-    doc = PromptDocument()
-    drops: list[CompressionEntry] = []
+    """把 IR 组装成一份可直接投喂的提示词。
 
-    # ① 参数声明（★ 按交付模式决定是否写）
+    ``compress_to_budget`` 默认开启：PRD 明列"正文常超 800 字"是红线风险，
+    所以组装阶段就按优先级压缩，而不是把问题丢给用户。
+    压完仍超预算的话，闸门 G7 会如实报出还差多少。
+    """
+    lib = library or ph.load_library()
+    model = str(ir.get("meta", {}).get("target_model") or "seedance-2.0")
+    limit = budget if budget is not None else int(lib.capacity_for(model)["prompt_char_budget"])
+
+    plan = compress(ir, lib, budget=limit) if compress_to_budget else _CompressionPlan(
+        quality_preset_text=True, person_longtail=True,
+        forbidden_low_freq=True, beat_body_limit=0,
+    )
+
     include_header = with_param_header
     if include_header is None:
         mode = str(ir.get("delivery", {}).get("mode") or DeliveryMode.PHASE1_MANUAL.value)
@@ -889,28 +1026,51 @@ def assemble(
             mode == DeliveryMode.PHASE1_MANUAL.value
             and bool(ir.get("delivery", {}).get("include_param_header", True))
         )
-    if include_header:
+
+    doc = _build_document(ir, lib, plan, with_param_header=include_header)
+    doc.budget = limit
+    doc.compression = plan.entries
+    return doc
+
+
+def _build_document(
+    ir: Mapping[str, Any],
+    library: ph.PhraseLibrary,
+    plan: _CompressionPlan,
+    *,
+    with_param_header: bool,
+) -> PromptDocument:
+    handles = HandleResolver(ir)
+    doc = PromptDocument()
+    over: list[str] = []
+
+    # ① 参数声明（★ 按交付模式决定是否写）
+    if with_param_header:
         meta = ir.get("meta", {})
-        duration = effective_duration(ir)
         doc.param_header = PARAM_HEADER_TEMPLATE.format(
             ratio=str(meta.get("aspect_ratio") or "9:16"),
-            duration=_fmt_sec(duration),
+            duration=_fmt_sec(effective_duration(ir)),
             resolution="720p",
         )
 
     # ③~⑨ 关键一致性
     locked_lines: list[str] = []
     locked_lines.extend(_render_scene(ir, handles))
-    locked_lines.extend(_render_person(ir, handles, lib, drops))
+    locked_lines.extend(_render_person(ir, handles, library))
     locked_lines.extend(_render_blocking(ir))
     locked_lines.extend(_render_camera(ir))
-    locked_lines.extend(_render_quality(ir, lib, drops))
+    locked_lines.extend(_render_quality(ir, library,
+                                        include_preset_text=plan.quality_preset_text))
     locked_lines.extend(_render_audio(ir, handles))
+    if not plan.person_longtail:
+        locked_lines = [PERSON_LONGTAIL_RE.sub("。", line) for line in locked_lines]
+    if not plan.quality_preset_text:
+        preset = str(ir.get("locked", {}).get("B5_quality", {}).get("preset") or "")
+        if preset:
+            locked_lines.append(f"画质档位：{preset}。")
     if locked_lines:
         doc.sections.append(PromptSection(
-            title=fw.SEC_LOCKED,
-            lines=locked_lines,
-            sources=["locked"],
+            title=fw.SEC_LOCKED, lines=locked_lines, sources=["locked"],
         ))
 
     # ② 参考素材清单 —— 只列在正文里真正声明了用途的素材
@@ -918,9 +1078,7 @@ def assemble(
     ref_lines = handles.table_lines(declared)
     if ref_lines:
         doc.sections.insert(0, PromptSection(
-            title=fw.SEC_REFS,
-            lines=ref_lines,
-            sources=["references"],
+            title=fw.SEC_REFS, lines=ref_lines, sources=["references"],
         ))
     missing_roles = [t for t in handles.all_tokens if t not in declared]
 
@@ -928,48 +1086,45 @@ def assemble(
     logline = str(ir.get("creative", {}).get("C1_logline") or "").strip()
     if logline:
         doc.sections.append(PromptSection(
-            title=fw.SEC_LOGLINE,
-            lines=[logline],
-            sources=["creative.C1_logline"],
+            title=fw.SEC_LOGLINE, lines=[logline], sources=["creative.C1_logline"],
         ))
 
     # 镜头节拍
-    beats = _render_beats(ir)
+    beats = _render_beats(ir, max_body_chars=plan.beat_body_limit)
     if beats:
         doc.sections.append(PromptSection(
-            title=fw.SEC_BEATS,
-            lines=beats,
-            sources=["creative.C2_beats"],
+            title=fw.SEC_BEATS, lines=beats, sources=["creative.C2_beats"],
         ))
 
     # 对白与口型
     dialogue = _render_dialogue(ir)
     if dialogue:
         doc.sections.append(PromptSection(
-            title=fw.SEC_DIALOGUE,
-            lines=dialogue,
+            title=fw.SEC_DIALOGUE, lines=dialogue,
             sources=["creative.C2_beats[].dialogue"],
         ))
 
     # ⑩ 禁止项
-    forbidden = _render_forbidden(ir)
+    forbidden = _render_forbidden(
+        ir,
+        drop_groups=frozenset() if plan.forbidden_low_freq else _DROPPABLE_FORBIDDEN_GROUPS,
+    )
     if forbidden:
         doc.sections.append(PromptSection(
-            title=fw.SEC_FORBIDDEN,
-            lines=forbidden,
-            sources=["forbidden"],
+            title=fw.SEC_FORBIDDEN, lines=forbidden, sources=["forbidden"],
         ))
 
-    doc.strategy, split_issues = _split_summary(ir, lib)
-    doc.plan = _plans_of(ir, lib)
+    doc.strategy, split_issues = _split_summary(ir, library)
+    doc.plan = _plans_of(ir, library)
     doc.warnings = [issue.title for issue in split_issues]
-    doc.compression = compress(ir, lib)
     if missing_roles:
         doc.warnings.append(
             f"{len(missing_roles)} 个参考素材未在正文声明用途：{'、'.join(missing_roles)}"
         )
     if handles.lost_placeholders:
         doc.warnings.append(f"{handles.lost_placeholders} 个素材位未绑定，交付物将残留占位符")
+    if over:
+        doc.warnings.extend(over)
     return doc
 
 

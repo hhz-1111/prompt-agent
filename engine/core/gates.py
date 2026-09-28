@@ -324,10 +324,16 @@ def g7_char_budget(
     ir: Mapping[str, Any],
     library: ph.PhraseLibrary,
 ) -> GateResult:
-    """G7 字数预算（中文 ≤500 字建议值）。
+    """G7 字数预算（中文 ≤500 字**建议值**）。
 
-    按 PRD §5 示例的口径只数**中文字符**；英文画质预设不计入，
-    但会在结论里单独报出，不让它变成隐性成本。
+    为什么是告警而不是阻断：PRD §6.4.4 表格里 G7 的处置写的是
+    "按 §9.2 压缩并标注，或提示精简"，阻断清单里没有它；而
+    §11 表格更明确写成"≤500 字建议值"。把它当硬阻断会挡住**所有**
+    合法提示词 —— 实测 24 条真实爆款视频压到极限后仍在 650~850 字，
+    因为永不可裁的部分（D0+D7 约 227 字、站位、音色、台词）本身就很长。
+
+    组装阶段已按 §9.2 优先级压缩过。这里报的是**压完仍超出的部分**，
+    需要用户自己精简创作区内容 —— 所以建议必须可执行。
     """
     model = str(ir.get("meta", {}).get("target_model") or "seedance-2.0")
     limit = int(library.capacity_for(model)["prompt_char_budget"])
@@ -338,13 +344,17 @@ def g7_char_budget(
         detail += f"（+{extra} 字符英文/标点，不计入预算）"
     if count <= limit:
         return GateResult("G7", "字数预算", OK, detail)
+
+    saved = sum(entry.saved_chars for entry in doc.compression)
+    detail += f"，超出 {count - limit} 字"
+    if saved:
+        detail += f"（已按优先级压掉 {saved} 字）"
     return GateResult(
-        "G7", "字数预算", BLOCK,
-        f"{detail}，超出 {count - limit} 字",
+        "G7", "字数预算", WARN, detail,
         suggestion=(
-            "按压缩优先级裁剪：① B5 次要画质描述 → ② B2 人物长尾 → "
-            "③ D5/D6 低频禁止项 → ④ C2 情绪标签 → ⑤ B4 运镜展开。"
-            "永不可裁：站位、音色、台词原文、D0、D7。已生成压缩清单。"
+            f"已自动压缩到极限，仍需手动精简约 {count - limit} 字。"
+            "可从创作区入手：合并镜头节拍、精简动作描述、删减非必要禁止项。"
+            "永不可裁：站位、音色、台词原文、D0 通用禁止项、D7 对白锁定。"
         ),
     )
 

@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -38,6 +38,7 @@ from engine.core.ports import (
 from engine.core.types import (
     ConfidenceBasis,
     Provenance,
+    ShotMode,
     Span,
     compute_confidence,
 )
@@ -133,6 +134,7 @@ class Inferencer:
             progress("结构归纳", 0.75)
             try:
                 semantic = self.semantic.induce(understandings, transcript, info)
+                semantic = reconcile_shot_mode(semantic, len(shots))
             except Exception as exc:
                 degradations.append(f"结构归纳失败，场景类型与钩子位置待用户确认：{exc}")
 
@@ -377,6 +379,29 @@ def _camera_agrees(model_camera: str, cv_kind: str) -> bool:
     if cv_kind == "handheld":
         return model_camera in ("手持",)
     return True
+
+
+def reconcile_shot_mode(semantic: SemanticSummary, shot_count: int) -> SemanticSummary:
+    """让模型判定的镜头模式与 CV 实际切分数**对齐**。
+
+    为什么必须做：切分数是画面差分算出来的**确定事实**，
+    模型没有推翻它的依据。而 shot_mode 是致命级维度 —— 它决定拆条策略
+    与提示词条数。实测出现过"1 个镜头却判 multi_shot"的自相矛盾，
+    会直接产出错误的交付结构。
+
+    修正方向只有一个：向 CV 结果收敛。
+    """
+    if shot_count <= 1:
+        # 只切出一个镜头，就不可能是"多镜头切分"。
+        # 但 same_angle_segments 本质就是一个连续镜头按时间推进切段，
+        # 与 one_take 的区别在**拆条方式**而非切分数，所以要保留。
+        if semantic.shot_mode is ShotMode.MULTI_SHOT:
+            return replace(semantic, shot_mode=ShotMode.ONE_TAKE, note="已按 CV 切分数校正")
+        return semantic
+    # 多镜头时，"一镜到底"站不住
+    if semantic.shot_mode is ShotMode.ONE_TAKE:
+        return replace(semantic, shot_mode=ShotMode.MULTI_SHOT, note="已按 CV 切分数校正")
+    return semantic
 
 
 def build_inferencer(

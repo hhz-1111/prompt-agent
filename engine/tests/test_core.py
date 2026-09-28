@@ -447,10 +447,44 @@ class TestAssembler:
         assert any("S4" in i.suggestion for i in issues)
 
     def test_compression_is_never_silent(self, lib):
-        entries = assembler.compress(_sample_ir(), lib)
+        """压缩必须有记录、有理由，且绝不触碰永不可裁的内容。"""
+        entries = assembler.compress(_sample_ir(full_forbidden_library=True), lib).entries
         assert entries
         assert all(entry.reason for entry in entries)
         assert all(entry.saved_chars >= 0 for entry in entries)
+        steps = " ".join(entry.what for entry in entries)
+        for protected in ("站位", "音色", "台词"):
+            assert protected not in steps, f"{protected} 不该出现在可压缩清单里"
+
+    def test_compression_actually_reduces_length(self, lib):
+        """压缩不是建议，是真执行 —— 交付物必须真的变短。"""
+        ir = _sample_ir(full_forbidden_library=True)
+        plain = assembler.assemble(ir, lib, compress_to_budget=False)
+        squeezed = assembler.assemble(ir, lib, compress_to_budget=True)
+        assert squeezed.char_count < plain.char_count
+        assert squeezed.compression, "压缩必须留下记录"
+
+    def test_person_longtail_is_the_first_big_win(self, lib):
+        """人物长尾是 PRD 明列的第一个大杠杆，压缩后应只留硬约束句。"""
+        ir = _sample_ir(full_forbidden_library=True)
+        doc = assembler.assemble(ir, lib)
+        locked = doc.section(fw.SEC_LOCKED).body
+        if locked.count("形象参考") and doc.compression:
+            used = {entry.what for entry in doc.compression}
+            if assembler.PERSON_LONGTAIL_TEXT in used:
+                assert "用于" not in locked
+                assert "锁定人物五官脸型" in locked
+
+    def test_protected_content_survives_compression(self, lib):
+        """永不可裁：站位、音色、台词原文、D0、D7。"""
+        ir = _sample_ir(full_forbidden_library=True)
+        doc = assembler.assemble(ir, lib)
+        text = doc.body_text
+        assert "位置全程禁止变动" in text, "站位不可裁"
+        assert "百分百还原" in text, "音色不可裁"
+        assert "100%透明字幕" in text, "D0 不可裁"
+        assert "禁止修改对白台词" in text, "D7 不可裁"
+        assert "哪有啊，我就是每天在家练普拉提" in text, "台词原文不可裁"
 
 
 # ==========================================================================
@@ -529,14 +563,25 @@ class TestGates:
         assert result.blocking
         assert "王姐" in result.detail and "李姐" in result.detail
 
-    def test_g7_blocks_over_char_budget(self, lib):
-        """PRD 风险 4：全文禁止项库 + 完整句式必然超 500 字，闸门必须拦住。"""
+    def test_g7_warns_over_char_budget(self, lib):
+        """PRD 把 500 字定为「建议值」而非硬上限，处置是压缩+标注。
+
+        实测 24 条真实爆款视频压到极限仍在 650~850 字 ——
+        因为永不可裁的部分（D0+D7、站位、音色、台词）本身就很长。
+        所以这是告警，不是阻断。
+        """
         ir = _sample_ir(full_forbidden_library=True)
         doc = assembler.assemble(ir, lib)
         result = gates.g7_char_budget(doc, ir, lib)
-        assert result.blocking
+        assert result.status == gates.WARN
         assert "永不可裁" in result.suggestion
-        assert len(doc.compression) >= 3, "超预算时必须给出压缩清单，不能静默裁剪"
+        assert doc.compression, "超预算时必须留下压缩记录，不能静默裁剪"
+        assert "已按优先级压掉" in result.detail or doc.char_count <= 500
+
+    def test_g7_passes_within_budget(self, lib):
+        ir = _sample_ir(minimal=True)
+        doc = assembler.assemble(ir, lib)
+        assert gates.g7_char_budget(doc, ir, lib).status == gates.OK
 
     def test_g8_blocks_on_density(self, lib):
         """G8 是最容易被忽略但最致命的一项。"""
@@ -628,12 +673,24 @@ class TestGates:
     def test_blocked_report_is_not_deliverable(self, lib):
         """红线 10：闸门未全绿时不许声称可交付。"""
         ir = _sample_ir()
-        ir["references"][0]["asset_id"] = None
+        # 用确定性的阻断源：把强约束降级（G14），这是最常见也最致命的事故
+        ir["creative"]["C2_beats"][0]["blocking"] = "动作参考一下原片"
         doc = assembler.assemble(ir, lib)
         report = gates.run_gates(ir, doc, lib)
         assert not report.deliverable
         assert report.verdict == "BLOCKED"
-        assert report.blockers
+        assert {r.code for r in report.blockers} == {"G14"}
+        assert report.summary_lines()[-1] == "→ 阻断交付"
+
+    def test_warning_only_report_stays_deliverable(self, lib):
+        """只有告警（字数超建议值、必写维度缺）时仍可交付，但要如实标注。"""
+        ir = _sample_ir()
+        doc = assembler.assemble(ir, lib)
+        report = gates.run_gates(ir, doc, lib)
+        assert not report.blockers
+        assert report.deliverable
+        assert report.verdict in ("PASS_WITH_WARNINGS", "ALL_GREEN")
+        assert report.warnings
 
     def test_summary_lines_render(self, lib):
         ir = _sample_ir(minimal=True)
@@ -643,12 +700,15 @@ class TestGates:
         assert lines[0].startswith("G1")
         assert lines[-1].startswith("→")
 
-    def test_summary_blocks_on_real_budget_conflict(self, lib):
-        """完整双人长句版本会撞上 G7 —— 如实报出，不粉饰。"""
+    def test_summary_reports_budget_overrun(self, lib):
+        """完整双人长句版本会撞上字数建议值 —— 如实报出，不粉饰。"""
         ir = _sample_ir()
         report = gates.run_gates(ir, assembler.assemble(ir, lib), lib)
-        assert not report.deliverable
-        assert report.summary_lines()[-1] == "→ 阻断交付"
+        g7 = report.by_code("G7")
+        assert g7 is not None
+        assert g7.status == gates.WARN
+        assert "超出" in g7.detail and "压掉" in g7.detail
+        assert report.summary_lines()[-1].startswith("→")
 
 
 # ==========================================================================

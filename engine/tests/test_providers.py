@@ -16,7 +16,12 @@ from pathlib import Path
 import pytest
 
 from engine.app.config import Settings
-from engine.app.pipeline.infer import Inferencer, _camera_agrees, build_inferencer
+from engine.app.pipeline.infer import (
+    Inferencer,
+    _camera_agrees,
+    build_inferencer,
+    reconcile_shot_mode,
+)
 from engine.app.pipeline import to_ir as to_ir_module
 from engine.app.providers import cv as cv_layer
 from engine.app.providers.ffmpeg_media import (
@@ -266,6 +271,97 @@ class TestCvLayer:
         assert not _camera_agrees("手持", "push_in")
 
 
+class TestShotModeReconciliation:
+    """切分数是 CV 算出来的确定事实，模型没有推翻它的依据。
+
+    实测出现过"1 个镜头却判 multi_shot"的自相矛盾 —— 会直接产出错误的
+    拆条策略与提示词条数。
+    """
+
+    def test_single_shot_forces_one_take(self):
+        corrected = reconcile_shot_mode(_semantic(shot_mode=ShotMode.MULTI_SHOT), shot_count=1)
+        assert corrected.shot_mode is ShotMode.ONE_TAKE
+        assert "校正" in corrected.note
+
+    def test_multi_shot_forces_multi_shot(self):
+        corrected = reconcile_shot_mode(_semantic(shot_mode=ShotMode.ONE_TAKE), shot_count=3)
+        assert corrected.shot_mode is ShotMode.MULTI_SHOT
+
+    def test_consistent_mode_untouched(self):
+        original = _semantic(shot_mode=ShotMode.ONE_TAKE)
+        assert reconcile_shot_mode(original, shot_count=1) is original
+
+    def test_same_angle_segments_survives_single_shot(self):
+        """同机位分段本质就是一个连续镜头，不该被改成 multi_shot。"""
+        corrected = reconcile_shot_mode(
+            _semantic(shot_mode=ShotMode.SAME_ANGLE_SEGMENTS), shot_count=1
+        )
+        assert corrected.shot_mode is ShotMode.SAME_ANGLE_SEGMENTS
+
+    def test_pipeline_reconciles_end_to_end(self):
+        report = _inferencer(semantic=_StubSemantic(
+            _semantic(shot_mode=ShotMode.MULTI_SHOT)
+        )).infer("fake.mp4")
+        # _StubDetector 给 2 个镜头，所以 multi_shot 是自洽的
+        assert report.semantic.shot_mode is ShotMode.MULTI_SHOT
+
+        single = _inferencer(
+            detector=_StubDetector([ShotBoundary(1, 0, 9000)]),
+            semantic=_StubSemantic(_semantic(shot_mode=ShotMode.MULTI_SHOT)),
+        ).infer("fake.mp4")
+        assert single.semantic.shot_mode is ShotMode.ONE_TAKE
+
+
+class TestPersonExtraction:
+    def test_group_labels_are_filtered(self):
+        """群体不是个体：给「台下观众」建多视图既浪费配额又违反 D2。
+
+        这里让 ASR 只说"有人说话"但不给说话人，从而只考察视觉标签这一路。
+        """
+        visual = _StubVisual([
+            ShotUnderstanding(shot_index=1, people=("魏巍老师", "台下观众", "8名学员")),
+            ShotUnderstanding(shot_index=2, people=("魏巍老师",)),
+        ])
+        inferencer = _inferencer(
+            visual=visual,
+            transcriber=_StubTranscriber([
+                TranscriptSegment(text="大家好", span=Span(0, 2000), confidence=0.9),
+            ]),
+        )
+        report = inferencer.infer("fake.mp4")
+        ir = Inferencer.to_ir(report)
+        names = [p["name"] for p in ir["locked"]["B2_person"]]
+        assert names == ["魏巍老师"]
+
+    def test_person_count_is_capped(self):
+        """实测有一条带练视频抽出 10 个"人物"，生成 10 张多视图撞爆 9 张配额。"""
+        many = tuple(f"人物{i}" for i in range(10))
+        visual = _StubVisual([ShotUnderstanding(shot_index=1, people=many)])
+        report = _inferencer(visual=visual).infer("fake.mp4")
+        ir = Inferencer.to_ir(report)
+
+        assert len(ir["locked"]["B2_person"]) <= 4
+        image_refs = [r for r in ir["references"] if r["type"] == "multi_view"]
+        assert len(image_refs) <= 4
+
+    def test_overflow_is_reported_not_silent(self):
+        from engine.app.pipeline.to_ir import person_overflow_note
+
+        many = tuple(f"人物{i}" for i in range(10))
+        report = _inferencer(
+            visual=_StubVisual([ShotUnderstanding(shot_index=1, people=many)])
+        ).infer("fake.mp4")
+        note = person_overflow_note(report)
+        assert note
+        assert "已截取" in note
+
+    def test_no_overflow_produces_no_note(self):
+        from engine.app.pipeline.to_ir import person_overflow_note
+
+        report = _inferencer().infer("fake.mp4")
+        assert person_overflow_note(report) == ""
+
+
 # ==========================================================================
 # 编排：CV 优先与冲突处置
 # ==========================================================================
@@ -498,10 +594,12 @@ class TestToIr:
         report = _inferencer().infer("fake.mp4")
         assert Inferencer.to_ir(report)["delivery"]["strategy"] == "S2"
 
-        report2 = _inferencer(semantic=_StubSemantic(
-            _semantic(shot_mode=ShotMode.ONE_TAKE)
-        )).infer("fake.mp4")
-        assert Inferencer.to_ir(report2)["delivery"]["strategy"] == "S1"
+        # 单镜头 + one_take → S1
+        single = _inferencer(
+            detector=_StubDetector([ShotBoundary(1, 0, 9000)]),
+            semantic=_StubSemantic(_semantic(shot_mode=ShotMode.ONE_TAKE)),
+        ).infer("fake.mp4")
+        assert Inferencer.to_ir(single)["delivery"]["strategy"] == "S1"
 
     def test_reference_manifest_lists_materials(self):
         """Agent 只指名需要哪些素材，不生成素材。"""
