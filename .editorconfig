@@ -1,0 +1,26 @@
+# 编辑器统一规范：编码、行尾、缩进、结尾换行。
+# VS Code / PyCharm / IntelliJ / Sublime 都会自动读取，无需插件。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# 前端与配置文件按 2 空格缩进（与现有代码一致）
+[*.{ts,tsx,js,jsx,json,css,html,yml,yaml}]
+indent_size = 2
+
+# Markdown 里"行尾两个空格"表示强制换行，不能删
+[*.md]
+trim_trailing_whitespace = false
+
+# Windows 脚本保持 CRLF
+[*.{bat,cmd,ps1}]
+end_of_line = crlf
+
+[Makefile]
+indent_style = tab

@@ -89,6 +89,25 @@ cd web && npm install && npm run build && cd ..
 
 开发期可以前后端分离：`py scripts/run.py` + `cd web && npm run dev`（5173 端口，已配好代理）。
 
+### 部署到云服务器（Linux）
+
+后端会**同时提供前端页面**，所以生产环境只需要暴露 **8000 一个端口**。
+用 Docker 一条命令即可跑起来：
+
+```bash
+cp .env.example .env          # 填入 MIMO_API_KEY
+docker compose up -d --build
+#   → 界面 http://<服务器IP>:8000
+```
+
+完整步骤（建私有仓库 → 推送 → 服务器拉取 → 启动 → 验证 → 排错）
+见 **[`DEPLOY.md`](DEPLOY.md)**，其中也包含不用 Docker 的裸机方案。
+
+> **Linux 上必须加 `--host 0.0.0.0`**，否则只有服务器自己能访问：
+> `.venv/bin/python scripts/run.py --host 0.0.0.0 --port 8000`
+>
+> **只能单进程**：反推队列是进程内实现，不要用 `--workers N` 或多副本。
+
 ### 验证
 
 ```bash
@@ -101,7 +120,15 @@ cd web && npm install && npm run build && cd ..
 # 批量体检（对整个素材目录跑反推，产出可比较的基准数据）
 .venv\Scripts\python.exe scripts\benchmark.py --dir 测试素材
 .venv\Scripts\python.exe scripts\benchmark.py --dir 测试素材 --no-llm   # 只测 L0 技术层
+
+# 维度级准确率回归（PRD §6.1.5 的运镜/景别/站位目标线）
+.venv\Scripts\python.exe scripts\dimension_regression.py export --sample   # 生成标注清单
+.venv\Scripts\python.exe scripts\dimension_regression.py score            # 算准确率
 ```
+
+`benchmark.py` 覆盖的是**不依赖人工标注**的指标；要测 PRD §6.1.5 那三条
+目标线必须有 ground truth，走 `dimension_regression.py`（标注流程见
+`assets/regression/annotations/review.html`）。
 
 `benchmark.py` 是 PRD §6.1.5「回归基准」的工程雏形：有了真实视频，
 反推引擎的表现才有办法被**测量**而不是靠感觉。
@@ -304,17 +331,35 @@ MULTIMODAL / TEMPLATES / PHRASES 等规范文档
 代价是反推结果看着"不完整"。这是刻意的：猜错会导致后续全链路偏移，
 而用户很难发现（PRD 红线 7）。
 
-### CV 层有缺口，代码里写明了
+### CV 层：能力盘点运行时可查，缺口如实报出
 
-规范要求用光流算运镜、用人体框占比算景别、用检测框算站位。
-那需要 OpenCV + 姿态估计/人体检测 —— 当前环境（Python 3.14）装不上。
+规范要求用光流算运镜、用人体框占比算景别、用检测框算站位。这三条现在都接上了：
 
-所以 `providers/cv.py` 的策略是：**能确定性算的认真算，算不了的返回
-`unknown` 并登记缺口**，绝不编一个数字冒充 CV 结果。缺失的能力会体现在
-`/api/health` 的 `cv.missing` 里，对应维度的置信度自动降档为"模型单独判断"。
+| 维度 | 实现 | 依赖 |
+|---|---|---|
+| 运镜 | 分块光流：位移 / 方向一致度 / 径向散度 / 被摄体主导度 | `opencv-python` |
+| 景别 | YOLO 人体框**高度占比**分档 | `ultralytics` |
+| 站位 | 人物框 x 跨度中点 → 构图偏侧；逐人左右另存 | `ultralytics` |
+| 镜头切分 | PySceneDetect 自适应 + 内容双遍 | `scenedetect` |
 
-接入 OpenCV / YOLO / 外部检测服务后，改 `detect_capabilities()` 打开开关即可，
-其余代码不动。
+**每一层都是可选增强**：装不上就退回退路（运镜退回亮度序列，
+其余退回模型单独判断），并且 `detect_capabilities()` 会把缺口
+如实列进 `/api/health` 的 `cv.missing`，对应维度的置信度自动降档。
+绝不编一个数字冒充 CV 结果。
+
+两条分界线写在代码里，改之前请先读：
+
+1. **运镜只有光流算数**。亮度序列分不清"镜头在动"与"画面里的人在动"，
+   它只能保守地给 `fixed`/`unknown`，不算运镜维度被 CV 覆盖
+   （`CvCapabilities.motion_optical_flow` 就是标这个的）。
+2. **光流要用分块中位流**，不能逐像素加总 —— 人物朝镜头走近时剪影膨胀，
+   逐像素求径向散度会得出"镜头在拉远"的相反结论。
+   参见 `providers/optical_flow.py` 的 `_flow_stats` 注释。
+
+判据阈值全部在真实素材上量化确定（`scripts/motion_probe.py`、
+`scripts/calibrate_dimensions.py`、`scripts/fit_framing_bands.py`），
+**不允许在合成素材上校准** —— 这个坑踩过两次。
+
 
 ### 台词不做比例切分
 
@@ -382,6 +427,9 @@ PRD 风险 4 明列「提示词 500 字上限 vs 正文常超 1500 字」。
 | PUT | `/api/projects/{id}/dialogue` | 填台词 |
 | POST | `/api/projects/{id}/bind` | 绑定上游素材句柄 |
 | GET | `/api/projects/{id}/assemble` | 组装 + 14 项闸门 |
+| POST | `/api/projects/{id}/answer` | 回答 Agent 的选择题（答案直接落进 IR） |
+| POST | `/api/projects/{id}/revise` | **按用户的修改意见改写提示词**（F8.4，同步） |
+| POST | `/api/projects/{id}/revise/undo` | 撤销最近一轮改写 |
 | GET | `/api/projects/{id}/export?form=` | 三形态导出 |
 
 ---
@@ -407,7 +455,7 @@ PRD 风险 4 明列「提示词 500 字上限 vs 正文常超 1500 字」。
 | F5 素材清单 | **5 / 5** | |
 | F6 内容对齐 | **7 / 7** | 含三列对照表与未决门禁 G15 |
 | F7 模板与评分 | 0 / 5 | M3~M4 |
-| F8 效果评估 | 0 / 4 | M4 |
+| F8 效果评估 | **1 / 4** | 缺 F8.1~F8.3（需生成配额）；**F8.4 按建议重写已实现** |
 | 闸门 | **15 / 15** | 14 项常驻 + G15 条件出现 |
 
 合计 **59 / 68 ≈ 87%**。缺的部分**全部集中在 F7/F8**，

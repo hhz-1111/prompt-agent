@@ -1,0 +1,67 @@
+# ============================================================
+# 行尾与编码统一规范
+#
+# 本仓库要部署到 Linux 服务器，所以仓库内**一律 LF 行尾**。
+# 原因：CRLF 会让 shell 脚本报 "$'\r': command not found"，
+# 也会让 Dockerfile 与 heredoc 出现难以排查的怪问题。
+#
+# Windows 本机怎么处理：什么都不用做。Git 会在提交时自动按这里
+# 的规则规范化，你照常用 VS Code 编辑即可。
+# ============================================================
+
+# 默认：自动识别文本文件，仓库里存 LF
+* text=auto eol=lf
+
+# ---- 明确指定（避免 Git 猜错类型）----
+*.py          text eol=lf
+*.ts          text eol=lf
+*.tsx         text eol=lf
+*.js          text eol=lf
+*.jsx         text eol=lf
+*.json        text eol=lf
+*.md          text eol=lf
+*.toml        text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.css         text eol=lf
+*.html        text eol=lf
+*.txt         text eol=lf
+*.sh          text eol=lf
+*.sql         text eol=lf
+Dockerfile    text eol=lf
+.dockerignore text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+
+# ---- Windows 专用脚本必须保持 CRLF，否则双击运行会出错 ----
+*.bat         text eol=crlf
+*.cmd         text eol=crlf
+*.ps1         text eol=crlf
+
+# ---- 二进制：不做任何行尾/编码转换 ----
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.webp   binary
+*.ico    binary
+*.woff   binary
+*.woff2  binary
+*.ttf    binary
+*.otf    binary
+*.pdf    binary
+*.zip    binary
+*.gz     binary
+*.tar    binary
+*.mp4    binary
+*.MP4    binary
+*.docx   binary
+*.doc    binary
+*.pt     binary
+
+# ---- 语言识别（GitHub 统计语言占比用）----
+*.py     linguist-language=Python
+*.tsx    linguist-language=TypeScript
+*.ts     linguist-language=TypeScript
+assets/corpus/raw/*    linguist-documentation
+_extract/*             linguist-documentation
