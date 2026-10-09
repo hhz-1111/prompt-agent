@@ -45,3 +45,24 @@ web/tsconfig.tsbuildinfo
 yolov8n.pt
 *.pt
 *.part
+
+# ---- 内部资料：只留在本地，不进仓库 ----
+# 本仓库只放"实现功能与能力的代码"。下面是内部文档与评测数据，
+# 运行时不需要（唯一例外是 assets/phrases/phrases.json，它必须在仓库里）。
+# 这些文件在你本机 D:\deepseek\MOD 仍然存在，只是不再被 Git 跟踪。
+PRD-*.md
+FRAMEWORK-*.md
+AGENT-*.md
+MULTIMODAL-*.md
+PHRASES-*.md
+SAMPLES-*.md
+SCORING-*.md
+TEMPLATES-*.md
+HANDOFF.md
+docs/
+_extract/
+
+# 内部评测数据：只有 scripts/ 里的评测脚本会读，功能代码不读
+assets/corpus/
+assets/regression/
+assets/eval/
