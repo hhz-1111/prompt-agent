@@ -12,7 +12,36 @@ __pycache__/
 # ---- 运行时产物 ----
 workspace/
 .probe/
+Ultralytics/settings.json
+
+# ---- 回归标注 ----
+# 缩略图可以从视频重新生成（dimension_regression.py export --force），
+# 不进版本库。labels.csv 与 review.html 是人工产物，必须提交。
+assets/regression/annotations/thumbs/
 
 # ---- 前端 ----
 node_modules/
 web/dist/
+web/tsconfig.tsbuildinfo
+
+# ---- 大体积素材：只用于本地评测，云端部署不需要 ----
+# 24 条测试视频共 177MB，是本地评测的"考卷"；且都是真人素材，
+# 不适合推到云端仓库。需要评测时自行放回本目录。
+测试素材/
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+
+# ---- 原始 Word 素材 ----
+# 正文已经抽取进 assets/corpus/raw/ 与 _extract/，.docx 只是抽取前的原始件，
+# 合计约 60MB，部署与运行都不需要。
+*.docx
+*.doc
+
+# ---- 模型权重与下载残片 ----
+# yolov8n.pt 由 ultralytics 首次运行时自动下载；*.part 是下载中断的残片。
+yolov8n.pt
+*.pt
+*.part
