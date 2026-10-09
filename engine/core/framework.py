@@ -116,7 +116,46 @@ SEC_LOCKED = "关键一致性"
 SEC_LOGLINE = "剧情"
 SEC_BEATS = "镜头节拍"
 SEC_DIALOGUE = "对白与口型"
+SEC_AUDIO = "音色参考"
+"""音色绑定段。**永不可裁**（框架 §9.2）。
+
+为什么单独成段而不是并进「关键一致性」：它是**角色相关**的，
+紧跟在台词后面用户才能一眼看明白"谁说话、用谁的声音"。
+（框架 §8 的四段式里它属于 B 区"关键一致性"，内容未变，只是渲染位置靠后。）
+"""
+SEC_ACTION = "动作与物理"
+"""动作不变形的**正面约束**段落。
+
+**只对"有动作要复刻"的片子出现**（用户 2026-10-07）：
+口播/访谈/剧情对话类不该有这一段 —— 实测一条舞台口播视频里
+出现了「保持原有动作轨迹与幅度」，那是无对象的空约束
+（人物只是站着说话、左手做个展示手势）。
+
+判定看 ``meta.content_kind``（分析阶段专门判"有没有要复刻的身体动作"），
+**不是**看 genre —— 实测一条瑜伽带练被归成 dialogue、一条口播被归成 teaching，
+genre 分的是题材、不是"有没有动作"。
+"""
 SEC_FORBIDDEN = "禁止项"
+
+SEC_EXTENSIONS = "扩展段"
+"""**框架外信息**的落脚点（用户确认的第 ④ 批）。
+
+为什么需要它：取证已经能读到屏上大字（实测读到「美体普拉提 收紧身形 练出好气质」），
+但契约里没有任何字段能放它 —— 读完就丢。这类信息的共同点是
+**框架 13 个段落里一个都不覆盖**（屏上文案、分屏布局、变装切换点、对话轮次表…）。
+
+纪律：
+
+- **只能自检回路写**（``core/review.apply_extensions``），必须有画面证据；
+- **不替代任何核心段落**，渲染在【动作与物理】之后、【禁止项】之前；
+- 段落名不得与既有段落重名 —— 否则用户分不清哪段是框架的、哪段是扩展的。
+"""
+
+# 既有段落名：扩展段不得重名（否则交付物里会出现两个同名段落）
+FIXED_SECTIONS: tuple[str, ...] = (
+    SEC_PARAMS, SEC_REFS, SEC_LOCKED, SEC_LOGLINE, SEC_BEATS, SEC_DIALOGUE,
+    SEC_AUDIO, SEC_ACTION, SEC_FORBIDDEN,
+)
 
 
 # ==========================================================================
@@ -128,6 +167,18 @@ _META = _f("meta", "结构参数", KIND_OBJECT, PARAM, risk="critical", children
     _f("meta.shot_mode", "镜头模式", KIND_ENUM, PARAM, risk="critical",
        note="决定拆条策略与提示词条数 —— 改动风险最高",
        choices=("one_take", "multi_shot", "same_angle_segments")),
+    # **有没有要复刻的身体动作**（用户 2026-10-07）：决定【动作与物理】出不出现。
+    # 刻意**不从 genre 推** —— 实测 genre 判不准这件事：瑜伽带练被判成 dialogue、
+    # 舞台口播被判成 teaching。分析阶段专门判一次，见 infer/to_ir 的 content_kind。
+    _f("meta.content_kind", "内容类型", KIND_ENUM, PARAM, risk="high",
+       apply_section=SEC_ACTION, choices=("action", "speech"),
+       note="action=动作/体式/教学动作（要 1:1 复刻动作）；speech=口播/访谈/剧情（不做动作）"),
+    # **人物结构是谁定的**：model = 多模态模型对画面的判断；code = 模型没答，
+    # 代码按画面标签兜底推断。用户 2026-10-08 追问"有没有自适应" ——
+    # 这一位就是答案的凭据：推断出来的会如实标注，可据它判断可信度。
+    _f("meta.people_structure_source", "人物结构来源", KIND_ENUM, AUTO,
+       apply_section=SEC_LOCKED, choices=("model", "code"),
+       note="model=模型根据画面判断；code=模型没答，代码兜底推断"),
     _f("meta.aspect_ratio", "画面比例", KIND_ENUM, PARAM,
        choices=("9:16", "16:9", "1:1"), apply_section=SEC_PARAMS),
     _f("meta.total_duration_sec", "全片时长", KIND_NUMBER, AUTO, risk="critical",
@@ -152,6 +203,11 @@ _REFERENCES = _f("references", "参考物料", KIND_REF_LIST, FREE, risk="high",
     _f("references[].asset_id", "绑定素材句柄", KIND_TEXT, FREE, risk="high"),
     _f("references[].seedance_role", "Seedance 归属", KIND_ENUM, AUTO,
        choices=("reference_image", "reference_video", "reference_audio")),
+    # 自定义句柄标签（用户 2026-10-07）：默认句柄是 [视频1]/[图1]，
+    # 但有些素材用户要**自己上传**，标签得能自解释 ——
+    # 例如 [参考动作视频1]：一眼就知道"这个位置要传原片"。
+    _f("references[].token_label", "句柄标签", KIND_TEXT, FREE,
+       note="留空用默认（图/视频/音频）；填了就写成 [标签N]，用于用户自己上传的素材"),
     _f("references[].prep_step", "物料生成链顺序", KIND_NUMBER, AUTO),
     _f("references[].prep_prompt", "物料生成建议", KIND_LONGTEXT, AUTO),
 ))
@@ -176,6 +232,17 @@ _LOCKED = _f("locked", "关键一致性", KIND_OBJECT, LOCK, risk="critical",
     _f("locked.B2_person", "人物一致性", KIND_LIST, LOCK, risk="high",
        apply_section=SEC_LOCKED, children=(
         _f("locked.B2_person[].name", "角色名", KIND_TEXT, FREE),
+        _f("locked.B2_person[].display_name", "简短称呼", KIND_TEXT, AUTO, risk="low",
+           apply_section=SEC_LOCKED),
+        # AUTO 位：由角色名压出来的短名字（「紫色连衣裙女子」）。
+        # 视觉模型给的名字常拖着发型/配饰细节（实测出现过
+        # 「白色衬衫女子（灰白色短卷发、玳瑁色墨镜）」），读起来累。
+        # AUTO 位：**模型逐镜头说的**位置（「红衣者位于画面偏左」）优先，
+        # CV 检测框兜底。为什么不用检测框当主判据：框**没有身份**，
+        # 只能按序号把"最左的框"配给"第一个人"；后面的人被前面的人挡住
+        # 漏检时会安到错误的人头上（实测踩过）。
+        _f("locked.B2_person[].position", "画面位置", KIND_TEXT, AUTO, risk="high",
+           apply_section=SEC_LOCKED),
         _f("locked.B2_person[].multi_view_ref", "多视图引用", KIND_TEXT, FREE, risk="high"),
         _f("locked.B2_person[].lock_strength", "五官锁定强度", KIND_ENUM, PARAM,
            risk="high", apply_section=SEC_LOCKED, choices=("standard", "extreme")),
@@ -185,6 +252,26 @@ _LOCKED = _f("locked", "关键一致性", KIND_OBJECT, LOCK, risk="critical",
            apply_section=SEC_LOCKED, choices=("full", "brief")),
         _f("locked.B2_person[].blink", "眨眼节拍", KIND_ENUM, PARAM,
            apply_section=SEC_LOCKED, choices=("3-4s", "5s", "3s")),
+    )),
+    # 群体：**主体之外的那些人**（学员/观众/队员…）。
+    # 用户 2026-10-07：「其他学员直接由 Seedance 自己生成，只需要给她们定位成学员们，
+    # 然后穿着、年龄定位好，动作跟着老师做就行了 —— **这样就不需要那么多的提示词**。」
+    # 所以它**不是** B2_person 里的一条（那会占一张多视图配额、还会被编成"人物N"），
+    # 而是一句话：称呼 + 外观年龄 + 跟随谁。
+    _f("locked.B2b_ensemble", "群体", KIND_OBJECT, LOCK, apply_section=SEC_LOCKED,
+       note="主体之外的人（学员/观众…）作为一个群体描述；由生成模型自行生成，不占参考图",
+       children=(
+        _f("locked.B2b_ensemble.label", "群体称呼", KIND_TEXT, LOCK,
+           apply_section=SEC_LOCKED, note="如「学员们」「台下观众」"),
+        _f("locked.B2b_ensemble.look", "外观与年龄", KIND_LONGTEXT, LOCK,
+           apply_section=SEC_LOCKED, note="年龄段 + 穿着概况；看不出就留空，不猜"),
+        _f("locked.B2b_ensemble.follows", "动作跟随", KIND_TEXT, LOCK,
+           apply_section=SEC_LOCKED, note="跟随哪个主体（通常是人物1）；观众这类不跟随就留空"),
+        # **观众 ≠ 学员**（用户 2026-10-07 第二次指出）：学员跟着做动作，
+        # 观众只是在旁边看。写错会把"台下的观众"变成"跟着老师做同一套动作"。
+        _f("locked.B2b_ensemble.mode", "群体行为", KIND_ENUM, LOCK,
+           apply_section=SEC_LOCKED, choices=("follow", "watch"),
+           note="follow=跟着主体做同一套动作（学员）；watch=在旁边安静观看（观众/听众）"),
     )),
     _f("locked.B3_blocking", "空间与站位", KIND_OBJECT, LOCK, risk="critical",
        apply_section=SEC_LOCKED, children=(
@@ -242,6 +329,12 @@ _CREATIVE = _f("creative", "创作区", KIND_OBJECT, FREE, children=(
         _f("creative.C2_beats[].framing", "景别", KIND_ENUM, PARAM, risk="high",
            apply_section=SEC_BEATS,
            choices=("全景", "中全景", "中景", "中近景", "近景", "脸部特写")),
+        # 机位角度：这个镜头的**拍摄角度**（用户 2026-09-29 要求逐镜头写进镜头节拍）。
+        # 与 camera（运镜）分开：运镜回答"镜头怎么动"，角度回答"从哪个方向拍"。
+        # 原来的实现把「俯拍/仰拍」在 rig 映射里压成了"固定平视"，角度信息整块丢失。
+        _f("creative.C2_beats[].camera_angle", "机位角度", KIND_ENUM, PARAM, risk="high",
+           apply_section=SEC_BEATS,
+           choices=("平视", "俯视", "仰视", "正面", "过肩", "侧拍", "偷拍", "自拍")),
         _f("creative.C2_beats[].camera", "机位运镜", KIND_ENUM, PARAM, risk="high",
            apply_section=SEC_BEATS,
            choices=("平视", "正面", "过肩", "俯拍", "仰拍", "固定", "推近", "跟拍",
@@ -272,6 +365,25 @@ _CREATIVE = _f("creative", "创作区", KIND_OBJECT, FREE, children=(
             _f("creative.C2_beats[].dialogue.pause_at", "停顿点", KIND_ENUM_LIST, FREE,
                apply_section=SEC_DIALOGUE),
         )),
+    )),
+    # 扩展段：**框架外的信息有地方放**。
+    # 用户 2026-09-30 确认的第 ④ 批：取证已经能读到屏上大字（实测读到
+    # 「美体普拉提 收紧身形 练出好气质」），但契约里没有位置安放它，读完就丢。
+    # 这里的定位是"**可增可删的附加段落**"，不替代任何核心段落：
+    # 只有自检回路能写入（见 core/review.apply_extensions），且必须有画面证据。
+    _f("creative.C3_extensions", "扩展段", KIND_LIST, FREE, risk="medium",
+       apply_section=SEC_EXTENSIONS,
+       note="框架外信息的落脚点（屏上文案/分屏/变装点等），必须有画面证据",
+       children=(
+        _f("creative.C3_extensions[].title", "段落名", KIND_TEXT, FREE,
+           apply_section=SEC_EXTENSIONS,
+           note="不得与既有段落重名"),
+        _f("creative.C3_extensions[].lines", "内容", KIND_LIST, FREE,
+           apply_section=SEC_EXTENSIONS,
+           note="每条一句话，最多 3 条"),
+        _f("creative.C3_extensions[].evidence", "画面证据", KIND_TEXT, FREE,
+           apply_section=SEC_EXTENSIONS,
+           note="这一段的依据（哪一帧/哪次取证看到了什么）；空证据一律拒绝"),
     )),
 ))
 

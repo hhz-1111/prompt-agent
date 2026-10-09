@@ -300,7 +300,14 @@ def _dedupe(issues: Sequence[PhraseIssue]) -> list[PhraseIssue]:
 # 被引号/方括号包起来的内容是**提及**而非**主张**。
 # 例：D4 那条禁止项写作「禁止补充「服装保持一致」「参考图延续」等泛化一致性描述」
 # —— 它在*引用*要被禁掉的说法，本身不是泛化约束，不能误报。
-_QUOTED_SPAN = re.compile(r"「[^」]*」|“[^”]*”|『[^』]*』|\[[^\]]*\]|【[^】]*】")
+#
+# **ASCII 双引号必须在列表里**（实测踩过）：组装器包台词用的就是 `"…"`
+# （``assembler.ensure_quoted``，方舟官方建议的写法）。不认它的话，
+# 台词里的「你照着做就行」会被当成正文主张，G14 直接 block：
+# 「强约束被降级：1:1复刻 → 照着做就行」——用户一句正常台词就让整条片子不可交付。
+_QUOTED_SPAN = re.compile(
+    r"「[^」]*」|“[^”]*”|『[^』]*』|\[[^\]]*\]|【[^】]*】|\"[^\"]*\""
+)
 
 
 def strip_quoted(text: str) -> str:
@@ -388,6 +395,12 @@ def check_mandatory_dimensions(
     1. **逐字片段出现在最终提示词里**；
     2. **该维度在 IR 上确实有内容** —— 否则没有 mandatory 片段的维度
        （景别/机位/情绪）会在空 IR 上被判成"覆盖"。
+
+    例外（第 3 条）：**有逐字片段、且片段全部命中时，不再要求 IR 有内容**。
+    为什么（实测踩过）：眨眼节拍与皮肤质感是**无条件固定句**，没有人物条目时
+    正文里照样写着，而它们的 IR 内容挂在 ``locked.B2_person[]`` 下 ——
+    只看 IR 就会报「缺：眨眼节拍 / 整条未反推到」，可交付物里明明有这两句。
+    交付物才是用户真正拿去生成的东西，逐字要求以它为准。
     """
     leaves = dict(fw.flatten(ir))
     haystack = prompt_text if prompt_text is not None else "\n".join(_collect_text(ir))
@@ -397,7 +410,10 @@ def check_mandatory_dimensions(
         mandatory = tuple(dim.get("mandatory", ()))
         missing = _missing_fragments(mandatory, haystack)
         has_content = _dimension_has_content(leaves, dim)
-        if has_content and not missing:
+        if mandatory and not missing:
+            # 逐字表述全在交付物里 → 覆盖成立（见 docstring 第 3 条例外）
+            covered, implied = True, False
+        elif has_content and not missing:
             covered, implied = True, False
         elif not has_content:
             covered, implied = False, False

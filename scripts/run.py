@@ -67,6 +67,21 @@ def main() -> int:
     print(f"  框架版本   {__import__('engine.core.types', fromlist=['x']).FRAMEWORK_VERSION}")
     print(f"  视觉模型   {settings.model_vision}")
     print(f"  文本模型   {settings.model_text}")
+    # **自检模型要单独打出来**（用户 2026-10-07 问"你是不是没换模型"）：
+    # 它默认和文本模型**不一样**（实测换它以后自检 563 秒 → 52 秒），
+    # 但横幅原来只印三项，看起来就像没换过。
+    review_model = settings.model_review or settings.model_text
+    same = "" if settings.model_review else "（跟随文本模型）"
+    print(f"  自检模型   {review_model}{same}")
+    # 改写模型同理（用户 2026-10-08：所有 key 都要可换端点）：
+    # 它可能跑在**另一个端点**上，所以端点也一并印出来 ——
+    # 否则"我明明填了 DeepSeek，怎么还是原来的模型"会再问一次。
+    revise_base = settings.revise_endpoint[0]
+    revise_same = "" if settings.model_revise else "（跟随自检模型）"
+    revise_host = revise_base.split("//")[-1].split("/")[0]
+    print(f"  改写模型   {settings.resolved_model_revise}{revise_same}"
+          f"  @ {revise_host}"
+          f"{'' if settings.revise_api_key else '（用 MiMo 的 Key）'}")
     print(f"  ASR 模型   {settings.model_asr}")
     print(f"  工作区     {settings.workspace_dir}")
     print(f"\n  界面地址   http://{args.host}:{args.port}")

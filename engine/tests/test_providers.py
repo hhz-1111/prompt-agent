@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -286,6 +287,87 @@ class TestCvLayer:
         assert not _camera_agrees("手持", "push_in")
 
 
+class TestCompositionSide:
+    """构图偏侧 = 整个人物跨度的中点，**不是**最显眼那个人的左右。
+
+    实测踩过：双人镜头里两人在 x=0.30 与 0.69，取最靠左的人会判 left，
+    但人工标注一致认为这种"一左一右"就是居中。
+    """
+
+    @staticmethod
+    def _box(center_x: float, height: float = 0.5):
+        half = 0.05
+        return cv_layer.PersonBox(
+            x1=center_x - half, y1=0.1, x2=center_x + half, y2=0.1 + height,
+            confidence=0.9,
+        )
+
+    def test_two_people_either_side_is_center(self):
+        side, midpoint, count = cv_layer.composition_side([self._box(0.30), self._box(0.69)])
+        assert side == "center", f"一左一右应判居中，实得 {side}"
+        assert midpoint == pytest.approx(0.495, abs=0.01)
+        assert count == 2
+
+    def test_both_people_on_the_left_is_left(self):
+        side, midpoint, _ = cv_layer.composition_side([self._box(0.16), self._box(0.34)])
+        assert side == "left"
+        assert midpoint == pytest.approx(0.25, abs=0.01)
+
+    def test_single_person_uses_their_own_position(self):
+        assert cv_layer.composition_side([self._box(0.50)])[0] == "center"
+        assert cv_layer.composition_side([self._box(0.80)])[0] == "right"
+        assert cv_layer.composition_side([self._box(0.12)])[0] == "left"
+
+    def test_background_people_do_not_drag_the_composition(self):
+        """菜市场那类场景背景全是路人，不该把构图拽走。"""
+        side, _, count = cv_layer.composition_side([
+            self._box(0.50, height=0.92),
+            self._box(0.70, height=0.12),
+            self._box(0.94, height=0.07),
+        ])
+        assert side == "center"
+        assert count == 1, "背景路人（高度 0.12/0.07）不该进构图计算"
+
+    def test_no_boxes_gives_empty_not_a_guess(self):
+        assert cv_layer.composition_side([]) == ("", 0.0, 0)
+
+    def test_side_of_bands(self):
+        assert cv_layer.side_of(0.39) == "left"
+        assert cv_layer.side_of(0.40) == "center"
+        assert cv_layer.side_of(0.60) == "center"
+        assert cv_layer.side_of(0.61) == "right"
+
+
+class TestFramingBands:
+    """景别分档阈值来自 16 个已标注镜头（scripts/fit_framing_bands.py）。
+
+    这组断言把**实测校准出来的档位边界**钉住，防止日后被无意改回拍脑袋的数。
+    """
+
+    @staticmethod
+    def _box(height: float):
+        return cv_layer.PersonBox(x1=0.4, y1=0.0, x2=0.6, y2=height, confidence=0.9)
+
+    @pytest.mark.parametrize(
+        "height,expected",
+        [
+            (0.30, "全景"),
+            (0.47, "全景"),      # 标注"全景"的实测最大段
+            (0.57, "中全景"),    # 标注在这里给的是全景，是已知的边界损耗
+            (0.74, "中景"),      # 标注"中景"的实测最小段
+            (0.85, "中景"),
+            (0.92, "近景"),      # 标注"近景"的实测下限
+            (1.10, "脸部特写"),
+        ],
+    )
+    def test_bands_match_annotation(self, height: float, expected: str):
+        assert cv_layer.framing_from_person(self._box(height)).kind == expected
+
+    def test_unknown_ratio_band_is_honest(self):
+        """0.87 在标注里同时被标成中景与近景 —— 代码只能给一个答案，取中景。"""
+        assert cv_layer.framing_from_person(self._box(0.87)).kind == "中景"
+
+
 class TestVideoLimits:
     """PRD F1.1：≤3min / ≤500MB。超限要**早失败**，不是跑完再报错。"""
 
@@ -501,6 +583,433 @@ class TestPersonExtraction:
         assert person_overflow_note(report) == ""
 
 
+class TestUnidentifiedPersons:
+    """**实测踩过的坑**：视觉模型只给位置词时，位置词变成了人物名。
+
+    交付物里出现「左侧人物形象参考[左侧人物多视图]」——
+    凭空让用户准备一张不存在的素材，还多出两个假角色。
+    位置词不是身份：它随镜头变，也不是**人**的属性。
+    """
+
+    def test_pure_position_labels_are_not_identities(self):
+        from engine.app.pipeline.to_ir import dedupe_person_labels
+
+        assert dedupe_person_labels(["左侧人物", "中央人物", "右侧背影人物"]) == []
+
+    def test_position_words_are_stripped_when_appearance_remains(self):
+        from engine.app.pipeline.to_ir import dedupe_person_labels
+
+        # 同一人换机位 → 同一个身份键 → 合成一个
+        names = dedupe_person_labels(["左侧蓝衣男子", "右侧蓝衣男子", "后方蓝衣男子"])
+        assert len(names) == 1, names
+        assert "左" not in names[0] and "右" not in names[0] and "后" not in names[0]
+        # 名字统一压成「颜色+服装+性别」形式（用户 2026-09-29 指定的命名规则）
+        assert names == ["蓝色衣服男子"]
+
+    def test_duplicate_names_after_stripping_fall_back_to_index(self):
+        """剥掉位置词后撞名时退回「人物N」，而不是让两个角色同名。
+
+        用「女子」与「画面女子」构造：前者靠"剥离后剩下的字"取身份键，
+        后者靠"剥离后剩下的字"也一样 —— 两条不同身份键却会撞出同一个名字。
+        """
+        from engine.app.pipeline.to_ir import dedupe_person_labels
+
+        names = dedupe_person_labels(["中央女子", "背影女子"])
+        assert len({*names}) == len(names), f"不该有两个同名角色：{names}"
+        assert all("中央" not in n and "背影" not in n for n in names), names
+
+    def test_same_person_across_shots_still_collapses(self):
+        """同一个人换机位要合并 —— 位置词不同不构成"两个人"。"""
+        from engine.app.pipeline.to_ir import dedupe_person_labels
+
+        assert dedupe_person_labels(["中央女子", "左侧女子"]) == []
+        assert dedupe_person_labels(["中央紫衣女子", "画面左侧紫衣女子"]) == ["紫色衣服女子"]
+
+    def test_person_variants_in_shot_text_are_normalized(self):
+        """同一个人在同一片子里被写成两种名字时，逐镜头描述要收敛到规范名。
+
+        实测出现过的原样数据：人物清单是「灰色运动外套女子」，
+        而镜头 2/3 的 blocking 写的是「深灰运动外套女子」——
+        不收敛的话正文会一边写「人物1」一边冒出另一个名字，用户对不上号。
+        """
+        visual = _StubVisual([
+            ShotUnderstanding(shot_index=1, people=("米色开衫女子",),
+                              blocking="米色开衫女子沿木地板走向前台"),
+            ShotUnderstanding(shot_index=2, people=("灰色运动外套女子", "米色开衫女子"),
+                              blocking="深灰运动外套女子站在柜台内侧讲解"),
+        ])
+        report = _inferencer(
+            visual=visual,
+            transcriber=_StubTranscriber([
+                TranscriptSegment(text="你好", span=Span(0, 2000),
+                                  speaker="米色开衫女子", confidence=0.9),
+            ]),
+        ).infer("fake.mp4")
+        ir = Inferencer.to_ir(report)
+
+        names = [p["name"] for p in ir["locked"]["B2_person"]]
+        assert "灰色运动外套女子" in names, names
+        blocking = " ".join(b["blocking"] for b in ir["creative"]["C2_beats"])
+        assert "深灰运动外套女子" not in blocking, "同一身份的不同写法必须先收敛"
+        assert "灰色运动外套女子" in blocking
+
+    def test_alias_map_keeps_unknown_names(self):
+        """认不出身份的写法**原样保留** —— 不硬塞给别人。"""
+        from engine.app.pipeline.to_ir import canonical_person_mentions, person_alias_map
+
+        people = ["灰色运动外套女子", "米色开衫女子"]
+        aliases = person_alias_map(["深灰运动外套女子", "路过的快递员"], people)
+        assert aliases == {"深灰运动外套女子": "灰色运动外套女子"}
+        text = "路过的快递员递上包裹"
+        assert canonical_person_mentions(text, aliases) == text
+
+    def test_color_comes_from_the_same_garment(self):
+        """一次写两件衣服时，颜色必须跟**它修饰的那件**配对，且优先上衣。
+
+        实测踩过：模型给「红衣黑色短裤者」，独立取色取到「黑色」（短裤的），
+        独立取服装按词表顺序取到「短裤」，拼成「黑色短裤人物」——
+        这个人的红上衣在交付物里彻底消失，用户认不出是谁。
+        """
+        from engine.app.pipeline.to_ir import compact_person_name
+
+        assert compact_person_name("红衣黑色短裤者") == "红色衣服人物"
+        assert compact_person_name("浅紫色运动服扎发髻者") == "紫色运动服人物"
+        # 单字「衣」= 上衣，不是"随便一件衣服"
+        assert compact_person_name("蓝衣男子") == "蓝色衣服男子"
+
+    def test_short_reference_maps_to_the_same_person(self):
+        """同一段描述里先写全名、后面用简写（「红衣者」）时，两者必须认成一个人。"""
+        from engine.app.pipeline.to_ir import (
+            canonical_person_mentions,
+            compact_person_name,
+            dedupe_person_labels,
+            person_alias_map,
+        )
+
+        people = [
+            compact_person_name(name)
+            for name in dedupe_person_labels(["红衣黑色短裤者", "浅紫色运动服扎发髻者"])
+        ]
+        aliases = person_alias_map(
+            [], people, texts=["红衣者位于画面偏左，浅紫色运动服者位于其右后方"]
+        )
+        text = canonical_person_mentions("红衣者位于画面偏左", aliases)
+        assert "红衣者" not in text, aliases
+        assert text.startswith(tuple(people)), text
+
+    def test_aggregate_blocking_follows_the_model_not_the_boxes(self):
+        """聚合站位句也要用模型说的位置 —— 检测框会把屏幕/倒影里的人算进来。
+
+        实测踩过：演播厅单人示范片的背景大屏上印着 4 张人物照片，
+        YOLO 在右侧多检出 2 个框，交付物就写「有角色位于画面右侧（检测框中心
+        x≈0.816）」，而画面里只有 1 个人、且站在左侧。
+        """
+        from types import SimpleNamespace
+
+        from engine.app.pipeline import to_ir
+
+        ir = {"locked": {"B2_person": [{"name": "白色上衣男子"}], "B3_blocking": {}}}
+        report = SimpleNamespace(
+            shots=[
+                SimpleNamespace(
+                    people_count=3,
+                    blocking=[
+                        SimpleNamespace(x_ratio=0.242, side="left"),
+                        SimpleNamespace(x_ratio=0.816, side="right"),
+                    ],
+                    composition="center",
+                )
+            ],
+            understandings=[
+                SimpleNamespace(
+                    people=["白紫拼色上衣男子"],
+                    blocking="白紫拼色上衣男子站立于演播室地面中央偏左位置",
+                )
+            ],
+        )
+        to_ir._fill_blocking(ir, report)
+        text = "、".join(ir["locked"]["B3_blocking"]["positions"])
+        assert "有角色位于画面左侧" in text, text
+        assert "画面右侧" not in text, f"屏幕上的照片不该出现在站位里：{text}"
+        assert "检测框中心" not in text, f"有模型证据时不该再用检测框口径：{text}"
+
+    def test_aggregate_blocking_falls_back_to_boxes(self):
+        """模型一个位置都没说时，才退回检测框口径（带 x 值）。"""
+        from types import SimpleNamespace
+
+        from engine.app.pipeline import to_ir
+
+        ir = {"locked": {"B2_person": [{"name": "米色开衫女子"}], "B3_blocking": {}}}
+        report = SimpleNamespace(
+            shots=[
+                SimpleNamespace(
+                    people_count=1,
+                    blocking=[SimpleNamespace(x_ratio=0.294, side="left")],
+                    composition="center",
+                )
+            ],
+            understandings=[SimpleNamespace(people=["米色开衫女子"], blocking="米色开衫女子站着说话")],
+        )
+        to_ir._fill_blocking(ir, report)
+        text = "、".join(ir["locked"]["B3_blocking"]["positions"])
+        # 用户 2026-10-07：**不写「检测框中心 x≈0.294」这类内部量测标记** ——
+        # 那是我们自己的坐标，生成平台看不懂。量测值留在 provenance 里可追溯。
+        assert "有角色位于画面左侧" in text, text
+        assert "x≈" not in text and "检测框" not in text, text
+
+    def test_color_is_taken_from_the_leftmost_position(self):
+        """一次写两个颜色时取**文本最左**那个，不是词表里最靠前的那个。"""
+        from engine.app.pipeline.to_ir import _find_color, compact_person_name
+
+        assert _find_color("紫白色上衣女子") == "紫色"
+        assert _find_color("黑白色上衣女子") == "黑色"
+        assert _find_color("白紫拼色上衣男子") == "白色"
+        # 名字与身份键必须同一口径：否则同一个人算不出同一个键，别名表会失效
+        name = compact_person_name("白紫拼色上衣男子")
+        assert name == "白色上衣男子"
+        from engine.app.pipeline.to_ir import _identity_key
+
+        assert _identity_key("白紫拼色上衣男子") == _identity_key(name)
+
+    def test_gray_is_a_base_color_not_empty(self):
+        """「灰色」是基础色本身，不能归一成空。
+
+        实测踩过：单字「灰」在强度修饰词表里，`_base_color("灰色")` 返回空串 ——
+        于是**所有穿灰衣服的人身份键都成了空色**，与"压根没写颜色"的人同键，
+        两个不同的人会被并成一个（一个人凭空消失）。
+        """
+        from engine.app.pipeline.to_ir import (
+            _base_color,
+            _identity_key,
+            dedupe_person_labels,
+        )
+
+        assert _base_color("灰色") == "灰"
+        assert _base_color("深灰色") == "灰"
+        assert _base_color("灰米色") == "米"
+        # 灰色与"没写颜色"必须算出不同的键
+        assert _identity_key("灰色运动外套女子") != _identity_key("运动外套女子")
+        # 同一个人的灰色两种写法仍要合并（别名链靠它工作）
+        assert _identity_key("深灰运动外套女子") == _identity_key("灰色运动外套女子")
+        assert len(dedupe_person_labels(["灰色运动外套女子", "运动外套女子"])) == 2
+
+    def test_box_positions_refused_when_counts_disagree(self):
+        """检测框人数与模型人数对不上时，**不给**逐人位置（宁可不编）。
+
+        检测框会漏检被挡住的人，也会把屏幕/倒影里的人算成真人 ——
+        这时按"序号 → 人物"配位置就是把位置安到错误的人头上。
+        """
+        from types import SimpleNamespace
+
+        from engine.app.pipeline import to_ir
+
+        def report(model_people: int, cv_count: int):
+            return SimpleNamespace(
+                shots=[
+                    SimpleNamespace(
+                        people_count=cv_count,
+                        blocking=[SimpleNamespace(x_ratio=0.29, side="left")],
+                    )
+                ],
+                understandings=[
+                    SimpleNamespace(people=["x"] * model_people, blocking="没有任何位置描述")
+                ],
+            )
+
+        people = ["甲人物", "乙人物"]
+        # 人数一致 → 可以用框兜底
+        assert to_ir._person_positions(report(1, 1), people[:1])[0] == "画面左侧"
+        # 人数不一致 → 一个字都不给
+        assert to_ir._person_positions(report(2, 1), people) == ["", ""]
+
+    def test_rig_is_decided_by_majority_of_shots(self):
+        """整片机位按**多数镜头**投票，不是"第一个能判的镜头"说了算。
+
+        实测踩过：三镜头片子（镜1 跟拍 / 镜2 固定 / 镜3 固定）写成
+        「斯坦尼康跟拍」—— 全片只占 1/3，还挂着镜3"判定固定机位"的证据。
+        """
+        from types import SimpleNamespace
+
+        from engine.app.pipeline.infer import vote_rig
+
+        def shot(index: int, kind: str | None):
+            return SimpleNamespace(
+                boundary=SimpleNamespace(index=index),
+                motion=MotionEstimate(kind=kind, confidence=0.9, note="") if kind else None,
+            )
+
+        signals = [shot(1, "pan_or_track"), shot(2, "fixed"), shot(3, "fixed")]
+        rig, source, index = vote_rig(signals, [])
+        assert rig == "固定机位全程不变", rig
+        assert index == 2, "代表性镜头应取多数票里最早的那一镜"
+        assert source == "CV"
+        # 一个镜头都给不出 → 空
+        assert vote_rig([shot(1, None)], []) == ("", "", None)
+
+    def test_compact_naming_drops_decoration_and_normalizes_color(self):
+        """命名规则：颜色+服装+性别，丢掉发型/配饰，浅蓝归一成蓝色。"""
+        from engine.app.pipeline.to_ir import compact_person_name
+
+        assert compact_person_name("紫色连衣裙长卷发女子") == "紫色连衣裙女子"
+        assert compact_person_name("紫色背心扎马尾女子") == "紫色背心女子"
+        assert compact_person_name("白色衬衫女子（灰白色短卷发、玳瑁色墨镜）") == "白色衬衫女子"
+        assert compact_person_name("浅蓝运动装女子") == "蓝色运动装女子"
+        # 双服装时取第一件（上衣才是主体）
+        assert compact_person_name("灰色上衣深色长裤女子") == "灰色上衣女子"
+        # 真名不动
+        assert compact_person_name("王姐") == "王姐"
+        assert compact_person_name("魏巍老师") == "魏巍老师"
+
+    def test_appearance_only_labels_still_work(self):
+        from engine.app.pipeline.to_ir import dedupe_person_labels
+
+        names = dedupe_person_labels(["紫色上衣女子", "红衣男子"])
+        assert sorted(names) == sorted(["紫色上衣女子", "红色衣服男子"])
+
+    def test_no_person_entry_when_only_position_labels(self):
+        visual = _StubVisual([
+            ShotUnderstanding(shot_index=1, people=("左侧人物", "中央人物")),
+            ShotUnderstanding(shot_index=2, people=("左侧人物",)),
+        ])
+        # 隔离 ASR 那一路：只说"有人说话"，不给说话人
+        report = _inferencer(
+            visual=visual,
+            transcriber=_StubTranscriber([
+                TranscriptSegment(text="大家好", span=Span(0, 2000), confidence=0.9),
+            ]),
+        ).infer("fake.mp4")
+        ir = Inferencer.to_ir(report)
+
+        assert ir["locked"]["B2_person"] == [], "位置词不该变成人物条目"
+        fake = [r for r in ir["references"] if "多视图" in r["placeholder"]]
+        assert fake == [], f"不该为位置词派生多视图素材位：{fake}"
+
+    def test_asr_speaker_still_wins(self):
+        """ASR 说话人是"谁在说"的直接证据，不受位置词过滤影响。"""
+        visual = _StubVisual([ShotUnderstanding(shot_index=1, people=("左侧人物",))])
+        report = _inferencer(visual=visual).infer("fake.mp4")  # 默认 ASR 给「王姐/李姐」
+        ir = Inferencer.to_ir(report)
+        assert [p["name"] for p in ir["locked"]["B2_person"]] == ["王姐", "李姐"]
+
+    def test_no_person_means_no_blink_or_skin_module(self):
+        """连带后果要说清：眨眼节拍与皮肤质感句挂在人物条目下面，一起消失。"""
+        from engine.app.pipeline.to_ir import unnamed_person_note
+
+        visual = _StubVisual([ShotUnderstanding(shot_index=1, people=("左侧人物",))])
+        report = _inferencer(
+            visual=visual,
+            transcriber=_StubTranscriber([
+                TranscriptSegment(text="大家好", span=Span(0, 2000), confidence=0.9),
+            ]),
+        ).infer("fake.mp4")
+
+        note = unnamed_person_note(report)
+        assert note, "有人却认不出身份时必须给出说明，不能静默丢内容"
+        assert "眨眼节拍" in note and "皮肤质感" in note
+
+    def test_note_reaches_the_report_as_degradation(self):
+        """说明必须真的出现在反推报告里，否则界面上看不到。"""
+        visual = _StubVisual([ShotUnderstanding(shot_index=1, people=("左侧人物",))])
+        _, report = _inferencer(
+            visual=visual,
+            transcriber=_StubTranscriber([
+                TranscriptSegment(text="大家好", span=Span(0, 2000), confidence=0.9),
+            ]),
+        ).infer_to_ir("fake.mp4")
+
+        joined = " ".join(report.degradations)
+        assert "无法确定身份" in joined, f"降级说明里没有这条：{report.degradations}"
+
+    def test_note_is_empty_when_nobody_seen(self):
+        from engine.app.pipeline.to_ir import unnamed_person_note
+
+        report = _inferencer().infer("fake.mp4")
+        assert unnamed_person_note(report) == ""
+
+    def test_note_is_empty_when_identities_resolved(self):
+        from engine.app.pipeline.to_ir import unnamed_person_note
+
+        visual = _StubVisual([ShotUnderstanding(shot_index=1, people=("紫衣女子",))])
+        report = _inferencer(visual=visual).infer("fake.mp4")
+        assert unnamed_person_note(report) == ""
+
+
+class TestPersonFromVideoContent:
+    """人物身份、逐人位置、画面人数都必须来自**这条视频的实际内容**。
+
+    用户 2026-09-29 拿一条新套路的片子（演播厅双人普拉提示范）反馈：
+    「明明是两个人物，男的在前，女的在后，却未能识别」。
+    实测当时产出的是「人物1〔紫色衣服人物 · 画面左侧〕/人物2〔黑色短裤人物〕」
+    和「画面中固定 1 位人物出镜」—— 位置安错人、人数还自相矛盾。
+    """
+
+    @staticmethod
+    def _report():
+        visual = _StubVisual([
+            ShotUnderstanding(shot_index=1, framing="全景", camera="固定",
+                              people=("红衣黑色短裤者", "浅紫色运动服扎发髻者"),
+                              blocking="红衣黑色短裤者位于画面偏左，浅紫色运动服扎发髻者位于其右后方"),
+            ShotUnderstanding(shot_index=2, framing="全景", camera="固定",
+                              people=("红衣黑色短裤者", "浅紫色运动服扎发髻者"),
+                              blocking="红衣者位于画面偏左，浅紫色运动服者位于其右后方"),
+        ])
+        # 隔离出"人物"这一条链路：静音（不跑 ASR）、不注入人体检测器
+        return _inferencer(
+            visual=visual,
+            probe=_StubProbe(replace(_info(), mean_volume_db=-91.0)),
+            transcriber=_StubTranscriber([]),
+        ).infer("fake.mp4")
+
+    def test_two_people_are_named_by_what_they_wear(self):
+        ir = Inferencer.to_ir(self._report())
+        names = [p["name"] for p in ir["locked"]["B2_person"]]
+        assert len(names) == 2, names
+        assert "红色衣服人物" in names, f"红上衣的人被写成了别的：{names}"
+        assert "紫色运动服人物" in names, names
+
+    def test_positions_come_from_what_the_model_saw(self):
+        """逐人位置要用模型逐镜头说的左右/前后，而不是检测框的序号。"""
+        ir = Inferencer.to_ir(self._report())
+        by_name = {p["name"]: p["position"] for p in ir["locked"]["B2_person"]}
+        assert by_name["红色衣服人物"].startswith("画面左"), by_name
+        assert by_name["紫色运动服人物"].startswith("画面右"), by_name
+        assert "后" in by_name["紫色运动服人物"], f"女士在后方，位置没说清：{by_name}"
+
+    def test_arrangement_never_undercounts_the_people_list(self):
+        """人数不能少于人物清单 —— 检测框漏检不是"画面里没人"。"""
+        ir = Inferencer.to_ir(self._report())
+        positions = "、".join(ir["locked"]["B3_blocking"]["positions"])
+        assert "固定 2 位人物出镜" in positions, positions
+        assert "固定 1 位人物出镜" not in positions, positions
+
+    def test_arrangement_follows_the_model_over_the_detector(self):
+        """模型说 2 人、检出 1 人 → 写 2；模型说 1 人、检出 3 人 → 写 1。
+
+        两个方向都踩过：检出会**少检**（后排被挡住）也会**多检**
+        （背景大屏上印的人物照片被当成真人）。
+        """
+        from types import SimpleNamespace
+
+        from engine.app.pipeline import to_ir
+
+        def report(cv: list[int], model: int):
+            return SimpleNamespace(
+                shots=[SimpleNamespace(people_count=n) for n in cv],
+                understandings=[SimpleNamespace(people=["x"] * model, blocking="")] * len(cv),
+            )
+
+        assert to_ir._arrangement_sentence(
+            report([1, 1, 2, 1], 2)
+        ) == "画面中固定 2 位人物出镜，不做增减"
+        assert to_ir._arrangement_sentence(
+            report([3], 1)
+        ) == "画面中固定 1 位人物出镜，不做增减"
+        # 模型一个身份都给不出时才退回检出数
+        assert to_ir._arrangement_sentence(
+            report([2, 2], 0)
+        ) == "画面中固定 2 位人物出镜，不做增减"
+
+
 # ==========================================================================
 # 编排：CV 优先与冲突处置
 # ==========================================================================
@@ -526,6 +1035,48 @@ class _StubDetector:
 
     def detect(self, path, info, *, on_progress=None) -> list[ShotBoundary]:
         return self.shots
+
+
+class TestNullJsonFields:
+    """结构化输出里的字段可能是 ``null``，**不能因此崩掉整段理解**。
+
+    实测踩过（留出集里一条新套路片子暴露的）：
+    模型返回 ``{"shots": null}``，而代码写的是 ``raw.get("shots", [])`` ——
+    ``None`` 被当成可迭代对象，TypeError 直接把**整段视觉理解**降级丢掉：
+    「视觉理解失败，景别/机位降级为 CV 或留空：'NoneType' object is not iterable」。
+    """
+
+    def test_null_shots_does_not_raise(self):
+        from engine.app.providers.mimo_analysis import MimoVisualDescriber
+        from engine.core.contracts import ShotBoundary
+
+        describer = MimoVisualDescriber.__new__(MimoVisualDescriber)
+
+        class _Client:
+            def complete_json(self, **_kwargs):
+                return {"shots": None}
+
+        describer.client = _Client()
+        shots = [
+            ShotBoundary(index=1, start_ms=0, end_ms=1000),
+            ShotBoundary(index=2, start_ms=1000, end_ms=2000),
+        ]
+        out = describer.describe_shots(["a.jpg", "b.jpg"], shots)
+        # 一个镜头一条空记录（后续走"视觉理解全空"的降级说明），而不是抛异常
+        assert len(out) == 2
+        assert all(not item.description for item in out)
+
+    def test_null_edits_and_probes_do_not_raise(self):
+        from engine.app.providers.mimo_analysis import MimoPromptCritic
+
+        class _Client:
+            def complete_json(self, **_kwargs):
+                return {"edits": None, "probes": None}
+
+        critic = MimoPromptCritic.__new__(MimoPromptCritic)
+        critic.client = _Client()
+        outcome = critic.critique(prompt="p", evidence={})
+        assert outcome.edits == () and outcome.probes == ()
 
 
 class _StubVisual:
@@ -609,6 +1160,67 @@ def _inferencer(**kwargs) -> Inferencer:
     )
     defaults.update(kwargs)
     return Inferencer(**defaults)
+
+
+class TestSilentAudio:
+    """静音音轨不能送 ASR，更不能把编出来的东西当台词（实测踩过）。"""
+
+    @staticmethod
+    def _transcriber(record: list[str]) -> _StubTranscriber:
+        class _Recording(_StubTranscriber):
+            def transcribe(self, audio_path, model=None):
+                record.append(audio_path)
+                return super().transcribe(audio_path, model)
+
+        return _Recording([
+            TranscriptSegment(text="0, 1, 2, 3, 4, 5", span=Span(0, 9000),
+                              speaker="", confidence=0.689),
+        ])
+
+    def test_silent_track_skips_asr(self):
+        """平均响度 −91 dBFS（数字静音）→ 一次都不该调 ASR。"""
+        called: list[str] = []
+        report = _inferencer(
+            probe=_StubProbe(replace(_info(), mean_volume_db=-91.0)),
+            transcriber=self._transcriber(called),
+        ).infer("fake.mp4")
+        assert called == [], "静音音轨仍然调了 ASR"
+        assert not report.transcript
+        assert any("静音" in d for d in report.degradations), report.degradations
+
+    def test_loud_track_still_runs_asr(self):
+        called: list[str] = []
+        report = _inferencer(
+            probe=_StubProbe(replace(_info(), mean_volume_db=-18.0)),
+            transcriber=self._transcriber(called),
+        ).infer("fake.mp4")
+        assert called, "有声音的音轨反而没调 ASR"
+
+    def test_number_only_transcript_is_dropped(self):
+        """响度过了阈值、但转写里一个汉字一个字母都没有 → 按无语音丢弃。"""
+        report = _inferencer(
+            probe=_StubProbe(replace(_info(), mean_volume_db=-30.0)),
+            transcriber=self._transcriber([]),
+        ).infer("fake.mp4")
+        assert not report.transcript, "只含数字/标点的「转写」被当成了台词"
+        assert any("没有任何文字" in d for d in report.degradations), report.degradations
+
+    def test_speech_flag_needs_a_measured_level(self):
+        """量不到响度时不擅自判哑 —— 交给 ASR 与输出兜底。"""
+        assert _info().has_speech is True
+        assert replace(_info(), mean_volume_db=-91.0).has_speech is False
+        assert replace(_info(), has_audio=False, mean_volume_db=None).has_speech is False
+
+    def test_no_speech_means_no_voice_reference(self):
+        """静音片子不该派生音色素材位 —— 没有声音可以克隆。"""
+        report = _inferencer(
+            probe=_StubProbe(replace(_info(), mean_volume_db=-91.0)),
+            transcriber=self._transcriber([]),
+        ).infer("fake.mp4")
+        ir = Inferencer.to_ir(report)
+        assert ir["locked"]["B6_audio"] == []
+        audio_slots = [r for r in ir["references"] if r["type"] == "audio"]
+        assert audio_slots == [], f"静音片子派生出了音色素材位：{audio_slots}"
 
 
 class TestInferencer:
@@ -748,6 +1360,32 @@ class TestToIr:
         anchor = Inferencer.to_ir(report)["locked"]["B1_scene"]["anchor"]
         assert "未知" not in anchor
         assert "【场景参考图】" in anchor
+
+    def test_scene_anchor_carries_camera_texture(self):
+        """T-SCENE-1 规范里的 `{拍摄质感}` 占位符必须被填上。
+
+        这条曾经整块漏掉：规范写了占位符，代码里既没填也没报错，
+        于是"苹果手机拍摄质感"这个高频固定模块在 24 条反推里 0 条写出。
+        """
+        ir = Inferencer.to_ir(_inferencer().infer("fake.mp4"))
+        anchor = ir["locked"]["B1_scene"]["anchor"]
+        assert "{" not in anchor, f"锚定句里有没填的占位符：{anchor}"
+        assert "苹果手机拍摄质感" in anchor, anchor
+
+    @pytest.mark.parametrize("preset,expected", [
+        ("P1", "苹果手机拍摄质感"),
+        ("P2", "苹果手机前置摄像头原生自拍质感"),
+        ("P3", "ARRI原生色彩"),
+    ])
+    def test_camera_texture_follows_quality_preset(self, preset, expected):
+        from engine.app.pipeline.to_ir import _camera_texture
+
+        assert _camera_texture({"locked": {"B5_quality": {"preset": preset}}}) == expected
+
+    def test_camera_texture_falls_back_when_preset_unknown(self):
+        from engine.app.pipeline.to_ir import _camera_texture
+
+        assert _camera_texture({"locked": {"B5_quality": {"preset": "P9"}}}) == "真实相机拍摄质感"
 
     def test_unknown_placeholder_strings_are_cleaned(self):
         """模型把 unknown 写成中文"未知"时必须当空处理，不能当内容。"""

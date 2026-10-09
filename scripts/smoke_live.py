@@ -115,14 +115,20 @@ def main() -> int:
         mark = "已绑定" if slot["bound"] else "待绑定"
         print(f"   [{slot['type']:12}] {slot['slots']} · {mark}")
 
-    # 门禁：锁定位必须被 API 拦住
-    print("\n6) 门禁校验（锁定位应被拒绝）：")
-    blocked, allowed = 0, 0
-    for payload in (
-        {"path": "locked.B3_blocking.positions", "value": ["篡改"]},
-        {"path": "creative.C2_beats[1].beat_role", "value": "demo"},
-        {"path": "creative.C1_logline", "value": "用户改写的剧情主线"},
-    ):
+    # 门禁：锁定位必须被拦住；档位位必须按白名单卡；创作位必须放行。
+    # 三种位置的**预期行为不同**，混着测就会得出"门禁失效"的错误结论
+    # （这里踩过两次：`creative.C1_logline` 是 FREE、`locked.B4_camera.rig`
+    #   是 PARAM，它们可写都是正确的）。
+    print("\n6) 门禁校验（锁定位拒写 / 档位位卡白名单 / 创作位放行）：")
+    cases = (
+        ("锁定位", {"path": "locked.B3_blocking.positions", "value": ["篡改"]}, False),
+        ("锁定位", {"path": "locked.B1_scene.anchor", "value": "篡改"} , False),
+        ("档位位", {"path": "locked.B4_camera.rig", "value": "不存在的机位"}, False),
+        ("档位位", {"path": "locked.B4_camera.rig", "value": "固定机位全程不变"}, True),
+        ("创作位", {"path": "creative.C1_logline", "value": "用户改写的剧情主线"}, True),
+    )
+    failures = 0
+    for kind, payload, should_pass in cases:
         request = urllib.request.Request(
             f"{args.base}/api/projects/{pid}/field",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -132,14 +138,20 @@ def main() -> int:
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 json.loads(response.read().decode("utf-8"))
-            allowed += 1
-            print(f"   ✗ {payload['path']} 竟然可写")
+            passed = True
+            detail = "已写入"
         except urllib.error.HTTPError as exc:
-            blocked += 1
-            reason = json.loads(exc.read().decode("utf-8")).get("detail", "")
-            print(f"   ✓ 拒绝 {payload['path']}：{reason[:44]}")
-    if blocked < 2:
-        print("[X] 锁定位门禁失效")
+            passed = False
+            detail = json.loads(exc.read().decode("utf-8")).get("detail", "")[:44]
+        ok = passed == should_pass
+        failures += 0 if ok else 1
+        mark = "✓" if ok else "✗"
+        verdict = "放行" if passed else "拒绝"
+        expect = "应放行" if should_pass else "应拒绝"
+        print(f"   {mark} [{kind}] {payload['path']}（{expect}）→ {verdict}　{detail}")
+
+    if failures:
+        print(f"[X] 门禁行为与预期不符 {failures} 处")
         return 1
 
     assembled = call(args.base, f"/api/projects/{pid}/assemble")

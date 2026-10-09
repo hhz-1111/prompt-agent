@@ -38,6 +38,26 @@ class ShotMode(StrEnum):
     SAME_ANGLE_SEGMENTS = "same_angle_segments"  # 分镜但同机位分段
 
 
+class ContentKind(StrEnum):
+    """**这条片子有没有需要复刻的身体动作**（用户 2026-10-07 提出）。
+
+    为什么要单独判一次，而不是看 ``genre``（实测证据）：用户给的一条
+    瑜伽带练视频（老师带学员做侧伸展）被模型归成了 ``dialogue``，
+    而一条舞台口播被归成了 ``teaching`` —— **genre 是从"场景/题材"角度分的，
+    和"有没有动作要复刻"根本不是一回事**。
+
+    这一项直接决定交付物里出不出现【动作与物理】：
+
+        ACTION  动作/体式/教学动作 —— 动作是观看价值的一部分，必须 1:1 复刻
+        SPEECH  口播/访谈/剧情对话 —— 以说话为主，没有要复刻的身体动作
+
+    用户原话：「不涉及做动作的视频，就不用出现了」。
+    """
+
+    ACTION = "action"   # 动作 / 体式 / 教学动作
+    SPEECH = "speech"   # 口播 / 访谈 / 剧情对话
+
+
 class ReplacementLevel(StrEnum):
     """替换级别（框架 §0.2）。由参考物料的种类推导，不作为独立输入。"""
 

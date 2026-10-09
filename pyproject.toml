@@ -23,6 +23,10 @@ shots = ["scenedetect>=0.6.4"]
 # 置信度从 VLM_ALONE(0.70) 升到 CV(0.95)，必写维度覆盖显著提升。
 # 依赖 torch（CPU 版约 200MB），装不上时退回模型单独判断。
 vision = ["ultralytics>=8.3"]
+# 光流运镜（PRD F1.4）：把运镜从"保守判定"升级为真正的 CV 强判断 ——
+# 亮度序列分不清"镜头在动"与"画面里的人在动"，光流能。
+# 装不上时光流自动降级为亮度法，能力缺口在 CV 盘点里如实报出。
+flow = ["opencv-python-headless>=4.8"]
 dev = ["pytest>=8.0"]
 
 [tool.setuptools.packages.find]

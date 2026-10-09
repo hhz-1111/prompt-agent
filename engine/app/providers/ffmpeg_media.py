@@ -29,6 +29,10 @@ class MediaError(RuntimeError):
     """ffmpeg/ffprobe 调用失败。"""
 
 
+_MEAN_VOLUME_RE = re.compile(r"mean_volume:\s*(-?[\d.]+)\s*dB")
+"""ffmpeg ``volumedetect`` 的结论行：``mean_volume: -91.0 dB``。"""
+
+
 class FFmpegMedia:
     """``VideoProbe`` + ``ShotDetector`` 的 ffmpeg 实现。"""
 
@@ -69,7 +73,33 @@ class FFmpegMedia:
             codec=str(video.get("codec_name") or ""),
             audio_codec=str((audio or {}).get("codec_name") or ""),
             path=str(path),
+            mean_volume_db=self.measure_loudness(path) if audio is not None else None,
         )
+
+    def measure_loudness(self, path: str) -> float | None:
+        """量音轨的平均响度（dBFS）。量不到返回 ``None``。
+
+        为什么非量不可（实测踩过）：**"有音轨"不等于"有声音"**。
+        一条 14 秒的片子里挂了一条纯静音 AAC 轨（实测 mean −91.0 dBFS），
+        ffprobe 照样报 ``has_audio=True``，于是照常调 ASR；
+        而 ASR 在静音上编出了「0, 1, 2, …, 100.」这种"台词"，
+        一路写进了交付物的【对白与口型】和【音色参考】。
+
+        ``volumedetect`` 的结论走的是 **info 级日志**，所以这里**不能加**
+        ``-v error``，否则会被自己过滤掉。
+        """
+        try:
+            text = self._run_text([
+                self.settings.ffmpeg_bin,
+                "-hide_banner", "-nostats",
+                "-i", path,
+                "-af", "volumedetect",
+                "-f", "null", "-",
+            ])
+        except MediaError:
+            return None
+        match = _MEAN_VOLUME_RE.search(text)
+        return float(match.group(1)) if match else None
 
     # ------------------------------------------------------------------
     # 镜头切分
@@ -131,9 +161,12 @@ class FFmpegMedia:
         *,
         timestamps_sec: Sequence[float],
         width: int = 512,
+        crop: str = "",
     ) -> list[str]:
         """按时间点抽帧为 JPEG。
 
+        ``crop`` 是额外的 ffmpeg 滤镜（按需取证时用来**裁剪放大**局部 ——
+        屏上小字、产品细节、手势都得上放大才看得清）。
         用 ``-ss``（输入侧定位）+ 逐帧调用：3 分钟视频的镜头数通常在 30 以内，
         这点进程开销远小于"整段解码再筛帧"的代价，且时间点精确。
 
@@ -145,6 +178,8 @@ class FFmpegMedia:
         directory.mkdir(parents=True, exist_ok=True)
         out: list[str] = []
         failures: list[str] = []
+        # 裁剪放大时先裁再放大：直接 scale 会把细节一起缩掉
+        filters = f"{crop}," if crop else ""
         for index, ts in enumerate(timestamps_sec, start=1):
             target = directory / f"frame_{index:03d}.jpg"
             try:
@@ -154,7 +189,7 @@ class FFmpegMedia:
                     "-ss", f"{max(0.0, ts):.3f}",
                     "-i", path,
                     "-frames:v", "1",
-                    "-vf", f"scale={width}:-2",
+                    "-vf", f"{filters}scale={width}:-2",
                     "-q:v", "3",
                     str(target),
                 ])
@@ -303,26 +338,6 @@ def detect_cuts(
     return cuts
 
 
-def _build_boundaries(cut_ms: Sequence[int], duration_sec: float) -> list[ShotBoundary]:
-    """把切点整理成连续的镜头区间。首尾必须覆盖全片。"""
-    total_ms = int(round(duration_sec * 1000))
-    edges = [0]
-    for cut in cut_ms:
-        # 丢弃过于贴边的切点：它们通常是编码抖动，不是真切镜
-        if 60 < cut < total_ms - 60:
-            edges.append(cut)
-    edges.append(total_ms)
-    edges = sorted(set(edges))
-
-    boundaries: list[ShotBoundary] = []
-    for index in range(len(edges) - 1):
-        start, end = edges[index], edges[index + 1]
-        if end <= start:
-            continue
-        boundaries.append(ShotBoundary(index=index + 1, start_ms=start, end_ms=end))
-    return boundaries
-
-
 def _extract_pts_time(line: str) -> float | None:
     marker = "pts_time:"
     index = line.find(marker)
@@ -350,7 +365,11 @@ def _extract_scene_score(line: str) -> float | None:
 
 
 def _build_boundaries(cut_ms: Sequence[int], duration_sec: float) -> list[ShotBoundary]:
-    """把切点整理成连续的镜头区间。首尾必须覆盖全片。"""
+    """把切点整理成连续的镜头区间。首尾必须覆盖全片。
+
+    注：本函数原先在文件里**定义了两遍**（后者覆盖前者，内容相同），
+    纯属复制粘贴残留，已删掉重复的一份。
+    """
     total_ms = int(round(duration_sec * 1000))
     edges = [0]
     for cut in cut_ms:

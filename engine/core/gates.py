@@ -30,6 +30,11 @@ BLOCK = "block"
 # 密度上限（G8）：官方边界 —— 15 秒对应 2~4 个清晰节拍
 DENSITY_LIMIT = 0.27
 
+# 单次生成时长上限（秒）。与 assets/phrases/phrases.json 的
+# capacity.models[*].clip_duration_sec 上限一致；G8 用它判断
+# "目标时长是不是已经超出一次生成能覆盖的范围"。
+CLIP_DURATION_MAX = 15.0
+
 # 互斥模式：首帧 / 首尾帧 / 多模态参考 三者不可混用
 EXCLUSIVE_MODES = ("multimodal_reference", "first_frame", "first_last_frame")
 
@@ -153,8 +158,13 @@ def g1_placeholder_residue(doc: PromptDocument, ir: Mapping[str, Any]) -> GateRe
             evidence=tuple(residues[:8]),
         )
 
-    # 未解析的句柄：形如 [xxx] 但不是 [图N]/[视频N]/[音频N]
-    unresolved = _find_unresolved_handles(doc.body_text)
+    # 未解析的句柄：形如 [xxx]，但既不是 [图N]/[视频N]/[音频N]，
+    # 也不在这个 IR 声明的句柄清单里（自定义标签走这条）
+    from .assembler import HandleResolver
+
+    unresolved = _find_unresolved_handles(
+        doc.body_text, HandleResolver(ir).all_tokens
+    )
     if unresolved:
         return GateResult(
             "G1", "【】残留", BLOCK,
@@ -194,6 +204,7 @@ def g2_quota(
         counts[key] = counts.get(key, 0) + 1
 
     overflows: list[str] = []
+    shortfalls: list[str] = []
     for key, count in counts.items():
         bounds = capacity.get(key)
         if not bounds:
@@ -201,6 +212,10 @@ def g2_quota(
         low, high = bounds
         if count > high:
             overflows.append(f"{_role_cn(key)} {count} 个 > 上限 {high}")
+        elif low and count < low:
+            # 下限原来读出来了却从没用过（`low, high = bounds` 之后只判 high）。
+            # 参考图一张都没有时，人物/场景一致性就没有锚点 —— 这是要说的。
+            shortfalls.append(f"{_role_cn(key)} {count} 个 < 下限 {low}")
     total = sum(counts.values())
     mixed_cap = int(capacity.get("mixed_total", 0))
     if mixed_cap and total > mixed_cap:
@@ -212,6 +227,16 @@ def g2_quota(
             "；".join(overflows),
             suggestion=f"减少素材数量，或改用更高配额的模型（2.5 支持图1~30/视0~10/音0~10）。",
             evidence=tuple(overflows),
+        )
+    if shortfalls:
+        return GateResult(
+            "G2", "素材配额", WARN,
+            "；".join(shortfalls),
+            suggestion=(
+                "至少准备 1 张参考图（场景或人物多视图），"
+                "否则场景与人物一致性没有锚点，只能靠文字描述。"
+            ),
+            evidence=tuple(shortfalls),
         )
     return GateResult(
         "G2", "素材配额", OK,
@@ -254,19 +279,25 @@ def g3_exclusive_modes(doc: PromptDocument, ir: Mapping[str, Any]) -> GateResult
 def g4_contradiction(doc: PromptDocument, ir: Mapping[str, Any]) -> GateResult:
     """G4 正反矛盾。
 
-    注意 PRD §6.2.5 的裁决：``着装100%还原@人物多视图`` 与
+    PRD §6.2.5 的裁决：``着装100%还原@人物多视图`` 与
     ``禁止"服装保持一致"`` **不矛盾** —— 前者有具体参考对象（确定约束），
-    后者禁的是无对象的泛化表述。这里必须实现这个例外，否则会误报。
+    后者禁的是无对象的泛化表述。
+
+    所以这一条要拦的是**正文里自己冒出了泛化表述**（那才是 D4 存在的理由），
+    而不是"没勾选 D4 条目"。后者是**模板选择**，不是正反矛盾 ——
+    用户已经明确 D4 默认关闭，把它当矛盾会阻断每一条有着装约束的片子。
     """
     text = doc.full_text()
     forbidden_text = "\n".join(str(f.get("text") or "") for f in ir.get("forbidden", []))
     conflicts: list[str] = []
 
-    # 具体约束 vs 泛化禁止：共存，不算矛盾
+    # 具体约束 vs 泛化禁止：**只有正文自己写了无对象的泛化表述，才算矛盾**
     has_concrete_wardrobe = "着装100%还原" in text or "服装身形匹配参考图" in text
-    generic_ban = "服装保持一致" in forbidden_text or "参考图延续" in forbidden_text
-    if has_concrete_wardrobe and not generic_ban:
-        conflicts.append("写了具体着装约束，但缺少 D4 泛化约束防补条目")
+    generic_phrase = "服装保持一致" in text or "参考图延续" in text
+    if has_concrete_wardrobe and generic_phrase:
+        conflicts.append(
+            "同时出现具体着装约束与无对象的泛化表述（「服装保持一致」/「参考图延续」）"
+        )
 
     # 语义互斥：一镜到底 vs 推近
     if ("一镜到底" in text or "机位全程不变" in text) and "缓慢推近" in text:
@@ -282,7 +313,7 @@ def g4_contradiction(doc: PromptDocument, ir: Mapping[str, Any]) -> GateResult:
         return GateResult(
             "G4", "正反矛盾", BLOCK,
             "；".join(conflicts),
-            suggestion="逐条裁决：语义互斥需择一；数值冲突需统一；泛化防补条目请补 D4。",
+            suggestion="逐条裁决：语义互斥需择一；数值冲突需统一；泛化表述请改成带参考对象的具体约束。",
             evidence=tuple(conflicts),
         )
     return GateResult("G4", "正反矛盾", OK, "无冲突")
@@ -322,7 +353,31 @@ def g6_lipsync_binding(ir: Mapping[str, Any]) -> GateResult:
     }
     dialogue_speakers.discard("")
 
+    # **台词得像是能说出口的话**。原来只看说话人字符串，一句
+    # 「0, 1, 2, …, 100.」（静音音轨上 ASR 编出来的）绑好说话人就能通过 ——
+    # 实测事故就是这么过去的。判据取最保守：连一个汉字/字母都没有才提醒。
+    lines = [
+        str((beat.get("dialogue") or {}).get("line") or "").strip()
+        for beat in ir.get("creative", {}).get("C2_beats", [])
+    ]
+    spoken = [line for line in lines if line]
+    if spoken and not any(_TEXT_CHAR.search(line) for line in spoken):
+        return GateResult(
+            "G6", "口型与说话人", WARN,
+            f"{len(spoken)} 行台词里没有任何文字（只有数字/标点）",
+            suggestion="核对台词来源：参考视频可能没有说话声，这句不是真实台词。",
+            evidence=tuple(spoken[:2]),
+        )
+
     if not dialogue_speakers:
+        # 有台词却**一个说话人都没定下来**时不能报"无对白" —— 那句话与正文不符
+        # （实测踩过：3 行台词、没有【音色参考】段，G6 却说"无对白，无需绑定"）。
+        if spoken:
+            return GateResult(
+                "G6", "口型与说话人", OK,
+                f"{len(spoken)} 行台词没有说话人，无法核对音色绑定",
+                suggestion="先指定每句台词的说话人，再为对应角色绑定音色参考。",
+            )
         return GateResult("G6", "口型与说话人", OK, "无对白，无需绑定")
 
     unbound = sorted(dialogue_speakers - audio_speakers)
@@ -344,24 +399,36 @@ def g7_char_budget(
     ir: Mapping[str, Any],
     library: ph.PhraseLibrary,
 ) -> GateResult:
-    """G7 字数预算（中文 ≤500 字**建议值**）。
+    """G7 字数预算（交付提示词的**中文字数**上限）。
+
+    **预算值取自短语资产的 capacity 表，不在代码里写死**：
+    框架 §11 写的是"≤500 字建议值"，而运行时采用值由
+    ``assets/phrases/phrases.json`` 的 ``prompt_char_budget`` 决定
+    （2026-09-29 按用户要求调为 **800**）。
+
+    为什么调高：500 会让 G7 对**每一条**真实素材都告警 ——
+    实测 24 条爆款视频按 §9.2 全量压缩后中位仍在 825 字，
+    因为"永不可裁"区（B3 站位 / B6 音色 / C3 台词 / D0 / D7）与节拍行
+    （每行 100~110 字，不在可裁清单里）本身就占满了。
+    恒定告警的闸门等于没有闸门，"闸门全绿率"这个指标也就失去意义。
+    框架 §9.2 末尾原文是「≤500 字**或已标注压缩**」，本身就允许弹性。
 
     为什么是告警而不是阻断：PRD §6.4.4 表格里 G7 的处置写的是
-    "按 §9.2 压缩并标注，或提示精简"，阻断清单里没有它；而
-    §11 表格更明确写成"≤500 字建议值"。把它当硬阻断会挡住**所有**
-    合法提示词 —— 实测 24 条真实爆款视频压到极限后仍在 650~850 字，
-    因为永不可裁的部分（D0+D7 约 227 字、站位、音色、台词）本身就很长。
+    "按 §9.2 压缩并标注，或提示精简"，阻断清单里没有它。
 
     组装阶段已按 §9.2 优先级压缩过。这里报的是**压完仍超出的部分**，
     需要用户自己精简创作区内容 —— 所以建议必须可执行。
     """
     model = str(ir.get("meta", {}).get("target_model") or "seedance-2.0")
     limit = int(library.capacity_for(model)["prompt_char_budget"])
-    count = doc.char_count
-    extra = doc.total_char_count - count
+    # **按提交口径判**（中文+字母+数字，不含标点/空白）：被判预算的是提交给平台的
+    # 那串文本。原来只数中文，静音片上 ASR 编出的「0, 1, 2, …」736 中文字 /
+    # 1232 总字符却判"合规"—— 最典型的垃圾内容恰好免疫。
+    count = doc.content_char_count
+    cjk = doc.char_count
     detail = f"{count}/{limit}"
-    if extra:
-        detail += f"（+{extra} 字符英文/标点，不计入预算）"
+    if cjk != count:
+        detail += f"（其中中文 {cjk}）"
     if count <= limit:
         return GateResult("G7", "字数预算", OK, detail)
 
@@ -408,6 +475,26 @@ def g8_density(ir: Mapping[str, Any]) -> GateResult:
     density = len(beats) / duration
     per_beat = duration / len(beats)
     detail = f"密度 {len(beats)}÷{duration:g}={density:.2f}（每节拍 {per_beat:.1f} 秒）"
+
+    # 目标时长**超出单次生成上限**、而节拍合计远小于它时才有问题：
+    # `effective_duration` 取两者较大值，`plan_split` 只按节拍合计拆条 ——
+    # 实测把目标时长改成 200 秒就能让"密度"过关，同一份交付物却出现
+    # "参数声明写 200 秒、拆条计划是 1 条 9 秒"的自相矛盾。
+    # 注意：**把目标时长拉长本身是正当的**（原片快切不等于要逐镜复刻，
+    # 用户可以把 9 秒的节拍摊到 20 秒里生成），所以只在超过单次上限时才提醒。
+    beat_total = sum(float(b.get("duration_sec") or 0) for b in beats)
+    target = float(ir.get("meta", {}).get("total_duration_sec") or 0)
+    if target > CLIP_DURATION_MAX and beat_total and target > beat_total * 1.2:
+        return GateResult(
+            "G8", "内容量匹配", WARN,
+            f"目标时长 {target:g} 秒超过单次生成上限 {CLIP_DURATION_MAX:g} 秒，"
+            f"而节拍合计只有 {beat_total:g} 秒（{detail}）",
+            suggestion=(
+                f"拆条计划按节拍合计 {beat_total:g} 秒算，跟目标时长 {target:g} 秒不是一回事。"
+                f"要么把目标时长降到实际节拍规模，要么按目标时长补足节拍内容。"
+            ),
+        )
+
     if density <= DENSITY_LIMIT:
         return GateResult("G8", "内容量匹配", OK, detail)
 
@@ -415,7 +502,7 @@ def g8_density(ir: Mapping[str, Any]) -> GateResult:
     # 只说"拆条"是误导 —— 拆条解决不了"单位时间内节拍过多"。
     allowed_beats = max(1, int(duration * DENSITY_LIMIT))
     needed_seconds = round(len(beats) / DENSITY_LIMIT, 1)
-    clip_max = 15.0
+    clip_max = CLIP_DURATION_MAX
     segments = max(1, -(-int(needed_seconds) // int(clip_max)))
     return GateResult(
         "G8", "内容量匹配", BLOCK,
@@ -441,10 +528,15 @@ def g9_split_strategy(doc: PromptDocument, ir: Mapping[str, Any]) -> GateResult:
     }
     allowed = matrix.get(shot_mode, set())
     if strategy not in allowed:
+        # 镜头模式是枚举外的值时 allowed 是空集，原来的建议会渲成
+        # 「镜头模式 one_shot 下应选：」后面什么都没有 —— 用户无从下手。
+        options = "、".join(sorted(s.value for s in allowed)) or (
+            "S1 一镜到底 / S2 逐镜头 / S3 首尾帧 / S4 同角度分段"
+        )
         return GateResult(
             "G9", "拆条策略", BLOCK,
             f"{strategy.value} 与镜头模式 {shot_mode} 不符",
-            suggestion=f"镜头模式 {shot_mode} 下应选：{'、'.join(sorted(s.value for s in allowed))}",
+            suggestion=f"镜头模式 {shot_mode} 下应选：{options}",
         )
     return GateResult(
         "G9", "拆条策略", OK,
@@ -518,16 +610,22 @@ def g11_hook_preserved(
         )
     return GateResult(
         "G11", "钩子保留", OK,
-        f"{len(hooks)} 个钩子节拍，与原片同类（基准 {len(base_hooks)} 个）",
+        f"{len(hooks)} 个钩子节拍（基准 {len(base_hooks)} 个）",
+        suggestion="本闸门只比钩子**数量**；钩子类型/位置是否同类需要人工核对。",
     )
 
 
 def g12_ref_roles(doc: PromptDocument, ir: Mapping[str, Any]) -> GateResult:
-    """G12 参考素材角色已声明 —— 自动修复。
+    """G12 参考素材角色已声明。
 
     判据是**用途声明的关键片段**是否出现在正文，而不是素材名有没有出现：
     ``[图3] 菜市场场景图`` 只是清单命名，真正声明用途的是
     正文里的 ``场景环境参考[图3]``。
+
+    **本闸门不改任何东西**（原来报 `autofixed=True / 已自动补默认声明 N 项`，
+    可 doc 与 ir 一个字节都没动 —— 报告在说谎）。框架把 G12 记为"自动修复"，
+    但组装器根本没有"回头往正文里补一句"的入口；这里如实报成待办，
+    并给出可以直接抄进正文的句子。
     """
     from .assembler import DEFAULT_PURPOSE, HandleResolver, _ref_display_name, declared_tokens
 
@@ -552,10 +650,10 @@ def g12_ref_roles(doc: PromptDocument, ir: Mapping[str, Any]) -> GateResult:
             fixes.append(purpose.format(token=token))
     if missing:
         return GateResult(
-            "G12", "素材角色声明", OK,
-            f"已自动补默认声明 {len(missing)} 项，含：{'、'.join(missing[:4])}",
-            autofixed=True,
-            suggestion="请确认素材用途声明是否准确。建议写入正文：" + "；".join(fixes[:3]),
+            "G12", "素材角色声明", WARN,
+            f"{len(missing)} 个素材在正文里没有用途声明：{'、'.join(missing[:4])}"
+            f"（交付物未被自动改写）",
+            suggestion="请把用途写进正文，例如：" + "；".join(fixes[:3]),
             evidence=tuple(missing),
         )
     return GateResult("G12", "素材角色声明", OK, "每个引用都有用途")
@@ -628,14 +726,26 @@ def g15_alignment_resolved(
     if alignment is None:
         return None
     summary = alignment.get("summary") or {}
-    total = int(summary.get("total_slots") or 0)
+    bindings = list(alignment.get("bindings") or [])
+    total = int(summary.get("total_slots") or 0) or len(bindings)
     if total == 0:
         return None
 
-    pending = int(summary.get("pending") or 0)
-    unmatched = int(summary.get("unmatched") or 0)
-    orphans = int(summary.get("orphans") or 0)
-    bound = int(summary.get("bound") or 0)
+    # **以 bindings 为准，不信自报的 summary**（实测踩过）：
+    # `summary={"bound":2,"pending":0}` 而同一份数据里两条 binding 还是 `pending`
+    # 时，只读 summary 的判据会给出「2/2 个位置已绑定，无未决项」。
+    # 同一份 dict 里两套说法，应该信原始明细。
+    if bindings:
+        pending = sum(1 for b in bindings if b.get("status") == "pending")
+        orphans = sum(1 for b in bindings if b.get("status") == "orphan")
+        bound = sum(1 for b in bindings if b.get("status") == "bound")
+        unmatched = sum(1 for b in bindings if b.get("status") == "unmatched")
+        total = len(bindings)
+    else:
+        pending = int(summary.get("pending") or 0)
+        unmatched = int(summary.get("unmatched") or 0)
+        orphans = int(summary.get("orphans") or 0)
+        bound = int(summary.get("bound") or 0)
 
     problems: list[str] = []
     if pending:
@@ -704,6 +814,11 @@ def diff_locked(
     """逐字段比对锁定位。返回 ``(路径, 原值, 新值)``。
 
     只比对契约里标注为 LOCK 的位置 —— 用户能改的地方变了不算违规。
+
+    **两个方向都要比**（实测踩过）：原来只遍历基准里存在的路径，
+    于是"给人物数组凭空加一个人"完全无声 —— 新增成员的路径在基准里没有，
+    循环根本走不到它。而"凭空多一个角色"恰恰是最像复刻事故的改动
+    （多出来的人没有多视图素材，生成时会漂移）。
     """
     before = dict(fw.flatten(baseline))
     after = dict(fw.flatten(current))
@@ -717,6 +832,13 @@ def diff_locked(
             diffs.append((path, old_value, None))
         elif _normalize(new_value) != _normalize(old_value):
             diffs.append((path, old_value, new_value))
+    for path, new_value in after.items():
+        if path in before:
+            continue
+        spec = fw.spec_for(path)
+        if spec is None or spec.category.value != "LOCK":
+            continue
+        diffs.append((path, None, new_value))
     return diffs
 
 
@@ -740,25 +862,38 @@ def _normalize(value: Any) -> Any:
 
 
 def _find_residues(text: str) -> list[str]:
-    import re
+    """正文里残留的 ``【…】``。
 
-    return [f"【{m}】" for m in re.findall(r"【([^】]{1,40})】", text)]
+    判据与组装器的解析用**同一个正则**（``assembler.PLACEHOLDER_RE``）——
+    两处各写一个长度上限时，长素材名会掉进"解析不了、也检测不到"的缝里。
+    """
+    from .assembler import PLACEHOLDER_RE
+
+    return [f"【{m}】" for m in PLACEHOLDER_RE.findall(text)]
 
 
 _LEGAL_HANDLE = re.compile(r"\[(?:图|视频|音频)\d+\]")
 _ANY_BRACKET = re.compile(r"\[([^\]\n]{1,24})\]")
+_TEXT_CHAR = re.compile(r"[A-Za-z\u4e00-\u9fff]")
+"""台词/正文里"确实有内容"的字符：汉字或拉丁字母。"""
 
 
-def _find_unresolved_handles(text: str) -> list[str]:
-    """找出形如 ``[xxx]`` 但不是 ``[图N]``/``[视频N]``/``[音频N]`` 的引用。
+def _find_unresolved_handles(text: str, declared: Sequence[str] = ()) -> list[str]:
+    """找出形如 ``[xxx]`` 但**不是这个 IR 声明的句柄**的引用。
 
     这类残留说明句柄解析失败了 —— 它比 ``【】`` 更隐蔽，
     因为看起来"像是"一个正常引用。
+
+    ``declared`` 是 ``HandleResolver`` 给出的**本 IR 实际声明的句柄**
+    （用户 2026-10-07 加了自定义标签：``[参考动作视频1]``）。
+    判据从"匹配硬编码的 [图N] 模式"改成"**在声明清单里就算合法**"——
+    后者才是这件事的真正定义，也让自定义标签能用而不必改闸门。
     """
+    legal = set(declared)
     out: list[str] = []
     for match in _ANY_BRACKET.finditer(text):
         token = match.group(0)
-        if _LEGAL_HANDLE.fullmatch(token):
+        if token in legal or _LEGAL_HANDLE.fullmatch(token):
             continue
         out.append(token)
     return out

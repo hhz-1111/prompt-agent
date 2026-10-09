@@ -101,11 +101,17 @@ class PromptSection:
 
     ``lines`` 是**纯正文**，不含段落标题 —— 因此 ``【题目】`` 不可能被
     占位符残留检查（G1）误判。标题只在渲染时加上去。
+
+    ``hints`` 是**给用户看的操作提示**（如"↳ 可替换：[图1] = 王姐多视图"），
+    **绝不进 ``body``/``text``/``full_text``**：它们不是提示词内容，
+    混进去会污染字数预算、闸门校验和导出到生成平台的正文。
+    前端单独渲染它们（可以做得比正文更醒目）。
     """
 
     title: str
     lines: list[str] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
+    hints: list[str] = field(default_factory=list)
 
     @property
     def body(self) -> str:
@@ -121,6 +127,7 @@ class PromptSection:
             "lines": list(self.lines),
             "text": self.text,
             "sources": list(self.sources),
+            "hints": list(self.hints),
         }
 
 
@@ -205,6 +212,17 @@ class PromptDocument:
     def total_char_count(self) -> int:
         """含英文与标点的总字符数（去掉空白）。用于体检与展示。"""
         return sum(1 for ch in self.body_text if not ch.isspace())
+
+    @property
+    def content_char_count(self) -> int:
+        """**提交口径**的字数：中文 + 拉丁字母 + 数字，不含空白与标点。
+
+        为什么 G7 用这个而不是中文字数（实测踩过）：被判预算的正是提交给平台的
+        那串文本。原来只数中文，于是 ASR 在静音上编出来的
+        「0, 1, 2, …, 100.」一个中文都没有 —— 736 中文字 / 1232 总字符却判"合规"。
+        现在数字与字母算内容，标点与空白不算（它们是排版，不是内容）。
+        """
+        return sum(1 for ch in self.body_text if ch.isalnum())
 
     @property
     def over_budget(self) -> int:
@@ -320,19 +338,20 @@ class HandleResolver:
         self._handles: dict[str, Handle] = {}
         self.unbound: list[str] = []
         self._defaults: dict[str, str] = {}
-        counters: dict[SeedanceRole, int] = {
-            SeedanceRole.IMAGE: 0,
-            SeedanceRole.VIDEO: 0,
-            SeedanceRole.AUDIO: 0,
-        }
+        # 编号**按句柄标签各自计**（不是按角色）：这样 [视频1] 与 [参考动作视频1]
+        # 可以并存 —— 用户 2026-10-07 要的正是这种可自解释的编号。
+        counters: dict[str, int] = {}
         for ref in ir.get("references", []):
             ref_type = _safe_ref_type(ref.get("type"))
             role = ROLE_OF_REF.get(ref_type, SeedanceRole.IMAGE)
-            counters[role] += 1
-            label = SEEDANCE_ROLE_LABEL[role]
-            token = f"[{label}{counters[role]}]"
+            # 句柄标签：默认按角色（图/视频/音频）；素材带 ``token_label`` 就用它 ——
+            # 用户自己上传的素材需要自解释的标签（``[参考动作视频1]``）。
+            label = str(ref.get("token_label") or "").strip() or SEEDANCE_ROLE_LABEL[role]
+            counters[label] = counters.get(label, 0) + 1
+            index = counters[label]
+            token = f"[{label}{index}]"
             name = _ref_display_name(ref)
-            handle = Handle(name=name, token=token, role=role, index=counters[role])
+            handle = Handle(name=name, token=token, role=role, index=index)
             for key in self._alias_keys(ref, name):
                 self._handles[key] = handle
                 self._defaults[key] = DEFAULT_PURPOSE[ref_type].format(token=token)
@@ -366,19 +385,6 @@ class HandleResolver:
             if key in self._defaults:
                 return self._defaults[key]
         return ""
-
-    def table_lines(self, declared: set[str] | None = None) -> list[str]:
-        """``【参考素材】`` 段的清单行。
-
-        给 ``declared`` 时只列**已在正文里声明用途**的素材 —— 这是原子性要求：
-        未声明的素材不能出现在清单里，否则交付物会出现"引用了但没说用途"的素材。
-        """
-        lines: list[str] = []
-        for handle in self._unique():
-            if declared is not None and handle.token not in declared:
-                continue
-            lines.append(f"{handle.token} {handle.name}")
-        return lines
 
     @property
     def all_tokens(self) -> list[str]:
@@ -471,20 +477,76 @@ def _render_scene(ir: Mapping[str, Any], handles: HandleResolver) -> list[str]:
     return [_replace_placeholders(anchor, handles)]
 
 
+def _render_ensemble(ir: Mapping[str, Any]) -> list[str]:
+    """群体句：主体之外的那些人（学员/观众）**一句话**说清。
+
+    用户 2026-10-07：「其他学员直接由 Seedance 自己生成，只需要给她们定位成学员们，
+    然后穿着、年龄定位好，动作跟着老师做就行了 —— **这样就不需要那么多的提示词**。」
+    又说：「台下的**观众们**是 AI 生成的群像，那么多人都定义为观众们，
+    只需要定义年龄和穿着即可。」
+
+    **两种群体行为分开写**（写错就很荒唐）：
+
+    - ``follow``（学员/队员）：跟着主体做同一套动作；
+    - ``watch``（观众/听众）：在旁边安静观看，不跟着做动作、不抢镜。
+    """
+    ensemble = ir.get("locked", {}).get("B2b_ensemble")
+    if not isinstance(ensemble, Mapping):
+        return []
+    label = str(ensemble.get("label") or "").strip()
+    look = str(ensemble.get("look") or "").strip()
+    follows = str(ensemble.get("follows") or "").strip()
+    mode = str(ensemble.get("mode") or "").strip() or ("follow" if follows else "watch")
+    if not label and not look:
+        return []
+    label = label or "其他人物"
+    head = f"{label}〔{look}〕：" if look else f"{label}："
+    # **措辞要避开 E 级（泛化）表述**：实测第一版写「保持一致」被 G14 判为
+    # 泛化约束直接阻断（资产里 "保持一致" 是 E 级模式）。
+    parts = ["由画面自然生成，五官不单独锁定"]
+    if mode == "follow" and follows:
+        parts.append(f"动作全程跟随{follows}做同一套动作，不自行增减动作")
+    else:
+        # 非"跟随"型群体**不替它们编行为**：观众是坐着看的，
+        # 而后景学员是在做瑜伽的 —— 一刀切写"安静观看"会把后者写错。
+        # 它们的动作在哪一拍里，由【镜头节拍】逐镜描述（用户 2026-10-07 指出）。
+        parts.append("按画面里的位置与动作自然存在，不遮挡主体、不抢镜")
+    return [head + "，".join(parts) + "。"]
+
+
 def _render_person(
     ir: Mapping[str, Any],
     handles: HandleResolver,
     library: ph.PhraseLibrary,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
+    """逐人物写形象参考句。
+
+    正文行格式：``人物1〔紫色连衣裙女子 · 画面中央〕：…形象参考[图1]，…``
+
+    返回 ``(正文行, 提示行)``。提示行通道（``PromptSection.hints``）保留但
+    **当前恒为空** —— 用户 2026-09-29 明确要求去掉「↳ 可替换：…」这类辅助标记。
+
+    **眨眼节拍与皮肤质感不在这里** —— 它们是无条件固定项，
+    由 ``_render_universal_person_phrases`` 统一渲染，
+    否则会在每个人物后面各重复一遍（实测过：双人片子渲出两遍）。
+    """
     lines: list[str] = []
-    for person in ir.get("locked", {}).get("B2_person", []):
+    hints: list[str] = []
+    persons = ir.get("locked", {}).get("B2_person", [])
+    for index, person in enumerate(persons, start=1):
         name = str(person.get("name") or "").strip()
+        display = str(person.get("display_name") or "").strip() or name
+        position = str(person.get("position") or "").strip()
         ref = str(person.get("multi_view_ref") or "").strip()
         if not name and not ref:
             continue
         token = handles.token_for(ref or name, fallback=f"[{name}多视图]")
+        head = f"人物{index}〔{display}"
+        if position:
+            head += f" · {position}"
+        head += "〕："
         parts = [
-            f"{name}形象参考{token}，用于{name}的五官细节、面部轮廓、外貌、"
+            f"{head}{display}形象参考{token}，用于{display}的五官细节、面部轮廓、外貌、"
             f"发型、体态和气质参考，呈现视觉辨识度，保持自然真实质感。"
         ]
         level_text = _person_level_text(library, str(person.get("lock_strength") or "standard"))
@@ -494,13 +556,56 @@ def _render_person(
         if wardrobe:
             text = _replace_placeholders(wardrobe, handles)
             parts.append(text if text.endswith("。") else text + "。")
-        skin_text = _skin_text(library, str(person.get("skin") or "brief"))
-        if skin_text:
-            parts.append(skin_text)
-        blink_text = _blink_text(library, str(person.get("blink") or ""))
-        if blink_text:
-            parts.append(blink_text)
         lines.append("".join(parts))
+        # 「↳ 可替换：[图N] = xxx」提示行**已按用户要求去掉**（2026-09-29）：
+        # 用户不要这类辅助标记，交付物就是干净的提示词正文。
+        # ``PromptSection.hints`` 通道保留，以后要加回只需在这里 append。
+    return lines, hints
+
+
+def _render_universal_person_phrases(
+    ir: Mapping[str, Any],
+    library: ph.PhraseLibrary,
+) -> list[str]:
+    """眨眼节拍 + 皮肤质感：**一律写进交付物**。
+
+    这两句是「模型默认会做错」的地方（眨眼频率不自然、过度磨皮），
+    所以它们是**无条件固定项**，不挂在人物条目下面。
+
+    取值规则：
+      眨眼 —— 有人物就取第一个人物的节拍（同一片子里所有人用同一节拍）；
+              没有人物条目就按内容类型取默认档（框架 §3 B5 的唯一参数化差异）；
+      皮肤 —— 短款 T-SKIN-2。长款留作可选项（长度预算吃紧时短款够用）。
+    """
+    blink_key = ""
+    for person in ir.get("locked", {}).get("B2_person", []):
+        candidate = str(person.get("blink") or "").strip()
+        if candidate:
+            blink_key = candidate
+            break
+    if not blink_key:
+        from engine.core.types import BlinkBeat, Genre
+
+        genre_text = str(ir.get("meta", {}).get("genre") or "")
+        try:
+            genre = Genre(genre_text)
+        except ValueError:
+            genre = Genre.DIALOGUE
+        blink_key = {
+            Genre.DIALOGUE: BlinkBeat.FIVE,
+            Genre.TEACHING: BlinkBeat.THREE_TO_FOUR,
+            Genre.STUDIO: BlinkBeat.THREE_TO_FOUR,
+            Genre.STREET_INTERVIEW: BlinkBeat.FIVE,
+            Genre.REPLACEMENT: BlinkBeat.THREE,
+        }.get(genre, BlinkBeat.FIVE).value
+
+    lines: list[str] = []
+    skin = _skin_text(library, "brief")
+    if skin:
+        lines.append(skin)
+    blink = _blink_text(library, blink_key)
+    if blink:
+        lines.append(blink)
     return lines
 
 
@@ -549,12 +654,163 @@ def _render_blocking(ir: Mapping[str, Any]) -> list[str]:
 
 
 def _render_camera(ir: Mapping[str, Any]) -> list[str]:
-    camera = ir.get("locked", {}).get("B4_camera", {})
+    """机位整句**不再单独渲染** —— 用户 2026-09-29 要求把它放进【镜头节拍】逐镜头写。
+
+    单独一句"机位：固定机位全程不变"在双人/多镜头片子里是**重复且更弱**的信息：
+    真正有用的是每个镜头怎么拍（「中景，平视机位拍摄，固定机位拍摄」）。
+    逐镜头机位已在 ``_render_beats`` 里写出。
+
+    函数保留是因为 ``locked.B4_camera.rig`` 仍是契约字段、
+    闸门 G13 的"机位"维度仍靠它判覆盖 —— 那是**数据层**的事，与渲染无关。
+    """
+    _ = ir
+    return []
+
+
+_BODY_MOVEMENT_WORDS = (
+    # 全身/四肢在动 —— 这些词出现才说明"有动作要复刻"
+    "伸展", "拉伸", "弯腰", "俯身", "屈膝", "下蹲", "深蹲", "弓步", "抬腿", "踢腿",
+    "压腿", "劈叉", "后仰", "前倾", "跳跃", "起跳", "转身", "转身", "翻滚", "俯卧撑",
+    "平板", "举腿", "卷腹", "开合跳", "体式", "瑜伽", "普拉提", "健身操", "舞蹈",
+    "手臂上举", "双臂", "双腿", "全身", "肢体",
+)
+"""**需要复刻的身体动作**的词。
+
+刻意不收「抬手/举手/手势/比划/持话筒」这类**说话时的小动作**：
+实测一条舞台口播片的动作描述是「右手持话筒于胸前，左手抬起做展示手势」——
+按小动作判会把口播片误判成动作片，正是用户反馈的那个错。
+"""
+
+
+_SCENE_ACTION_WORDS = (
+    "瑜伽", "普拉提", "健身", "舞蹈", "体式", "带练", "训练", "太极", "拉伸", "形体",
+)
+"""**场景本身就是动作场景**的词（「瑜伽教室带练」）。
+
+场景名比逐镜头的动作描述更稳：它是对全片的归纳。
+"""
+
+_SCENE_SPEECH_WORDS = ("口播", "访谈", "对话", "讲解", "聊聊", "带货")
+"""场景名里出现这些 → **一票否决**：口播/访谈/对话类的场景不写动作段。
+
+（否则「健身房口播」会被「健身」这两个字误判成动作片。）
+"""
+
+
+def looks_like_action(ir: Mapping[str, Any]) -> bool:
+    """按画面事实兜底判断"有没有要复刻的身体动作"。
+
+    只在 ``meta.content_kind`` 为空时用（模型没判出来）。
+
+    用户 2026-10-07 第二次强调：「**不需要模仿动作和不需要做动作的视频
+    都不需要**动作与物理」—— 所以这里取保守判据，两层：
+
+    1. **场景类型**优先：「瑜伽教室带练」这种本身就是动作场景；
+       但场景里有「口播/访谈/对话」就**一票否决**（否则「健身房口播」会被"健身"误判）；
+    2. 否则看**逐镜头动作描述**：要有身体动作的镜头达到 **60%**。
+       剧情片里有人弯腰捡东西、口播片里有人起身，都不算"要复刻的动作"。
+    """
+    scene = str(ir.get("locked", {}).get("B1_scene", {}).get("type") or "")
+    if any(word in scene for word in _SCENE_SPEECH_WORDS):
+        return False
+    if any(word in scene for word in _SCENE_ACTION_WORDS):
+        return True
+
+    beats = list(ir.get("creative", {}).get("C2_beats", []))
+    if not beats:
+        return False
+    hits = sum(
+        1 for beat in beats
+        if any(word in str(beat.get("blocking") or "") for word in _BODY_MOVEMENT_WORDS)
+    )
+    return hits >= 1 and hits * 5 >= len(beats) * 3
+
+
+def needs_action_physics(ir: Mapping[str, Any]) -> bool:
+    """这条片子要不要写【动作与物理】（用户 2026-10-07 的判据）。
+
+    **看 ``meta.content_kind``，不看 genre**：实测 genre 判不准这件事 ——
+    瑜伽带练被判成 dialogue、舞台口播被判成 teaching。
+    """
+    kind = str(ir.get("meta", {}).get("content_kind") or "").strip().lower()
+    if kind == "action":
+        return True
+    if kind in ("speech", "talking", "dialogue"):
+        return False
+    return looks_like_action(ir)
+
+
+def _render_action_physics(
+    ir: Mapping[str, Any],
+    handles: "HandleResolver",
+    library: ph.PhraseLibrary,
+) -> list[str]:
+    """动作与物理：**只有"有动作要复刻"的片子才写这一段**。
+
+    用户 2026-10-07 两条反馈：
+
+    1. 舞台纯口播的视频里**不该**出现这一段（人物只是站着说话 + 做展示手势）；
+    2. 动作类/体式类/教学动作类**必须**有一句 1:1 复刻动作的话，原话大意：
+       「视频里老师和学员的动作参考这个视频，1:1复刻视频里的肢体轨迹、
+        身体角度、抬手弯腰幅度，不出现任何其他动作，动作自然连贯。」
+
+    句子本身取自短语资产 ``T-ACTION``（单一来源，改措辞改资产、不改代码）；
+    这里只负责决定"写不写"和填槽。
+    """
+    if not needs_action_physics(ir):
+        return []
+
+    persons = ir.get("locked", {}).get("B2_person", [])
+    names = [
+        str(p.get("display_name") or p.get("name") or "").strip()
+        for p in persons
+    ]
+    who = "、".join(n for n in names if n) or "画面中人物"
+
+    # 参考动作视频的句柄（``[参考动作视频1]``）。``to_ir`` 会为动作类自动登记这条素材；
+    # 老数据（早于本轮）没有这条素材，退化成 ``[视频1]`` ——
+    # 它符合 ``[视频N]`` 句柄格式，G1 不会因为"未声明的句柄"阻断（见 gates）。
+    source = _video_handle(ir, handles) or "[视频1]"
     lines: list[str] = []
-    rig = str(camera.get("rig") or "").strip()
-    if rig and rig != UNKNOWN:
-        lines.append(f"机位：{rig}。")
+    template = library.templates.get("T-ACTION")
+    if template is not None:
+        try:
+            lines.append(template.render(who=who, 参考视频句柄=source))
+        except ValueError:  # pragma: no cover - 资产配置错误
+            lines = []
+    if not lines:
+        lines.append(
+            f"{who}的动作轨迹参考{source}，1:1复刻其中的肢体轨迹、身体角度、"
+            f"抬手弯腰幅度，不出现任何其他动作，动作自然连贯。"
+        )
+    lines.append(
+        f"{who}全程保持原有动作轨迹与幅度，肢体比例正常、动作连贯不变形；"
+        f"不出现扭曲手指、多手指、错位关节或身份漂移。"
+    )
     return lines
+
+
+def _video_handle(ir: Mapping[str, Any], handles: "HandleResolver") -> str:
+    """交付物里那条**参考动作视频**的句柄（``[参考动作视频1]``）。
+
+    优先取带自定义标签（``token_label``）的那条 —— 动作类片子会由 ``to_ir``
+    自动建一条 ``参考动作视频`` 素材，用户自己在生成平台把它传上去。
+    """
+    candidates = [
+        ref for ref in ir.get("references", [])
+        if str(ref.get("seedance_role") or "") == "reference_video"
+        or str(ref.get("type") or "") == "video"
+    ]
+    if not candidates:
+        return ""
+    preferred = [ref for ref in candidates if str(ref.get("token_label") or "").strip()]
+    for ref in (preferred or candidates):
+        slots = [str(s) for s in (ref.get("slots") or []) if str(s).strip()]
+        for candidate in (str(ref.get("placeholder") or ""), *slots):
+            token = handles.token_for(candidate) if candidate else ""
+            if token:
+                return token
+    return ""
 
 
 def _render_quality(
@@ -563,18 +819,55 @@ def _render_quality(
     *,
     include_preset_text: bool = True,
 ) -> list[str]:
-    quality = ir.get("locked", {}).get("B5_quality", {})
-    lines: list[str] = []
-    grain = str(quality.get("grain") or "").strip()
-    if grain:
-        lines.append(grain)
-    if include_preset_text:
-        preset = str(quality.get("preset") or "")
-        template = library.templates.get("T-QUALITY")
-        variant = template.variants.get(preset, "") if template and template.variants else ""
-        if variant:
-            lines.append(f"画质：{variant}。")
-    return lines
+    """画质相关内容。
+
+    **用户 2026-09-29 明确全部去掉**，原因是两条：
+
+      1. 「画质：auto white balance slightly cool, …」是**英文**，用户不要英文；
+      2. 「画质档位：P1」是个内部代号，用户看不懂，也没法直接用。
+
+    保留函数是因为 ``locked.B5_quality`` 仍是契约字段，
+    且以后可能按平台要求重新引入 —— 现在是**显式不渲染**，不是忘了。
+    """
+    _ = (ir, library, include_preset_text)
+    return []
+
+
+_LATIN_RUN = _re.compile(r"[A-Za-z]{3,}")
+_LATIN_WITH_SEP = _re.compile(r"[A-Za-z]{3,}\s*[、，]?")
+_CJK_CHAR = _re.compile(r"[\u4e00-\u9fff]")
+
+
+def _drop_english(lines: Sequence[str]) -> list[str]:
+    """摘掉正文里的英文**片段**（用户 2026-09-29 明确要求不要英文）。
+
+    **不能整行删**（实测踩过）：原来的判据是"含 ≥3 个连续拉丁字母的整行直接丢"，
+    于是「场景始终为[图3]的演播厅环境，背景有大屏PILATES标识，保持同一位置和
+    光线氛围」这种**中文句子**会因为一个品牌名被整句丢掉 —— 而场景锚定是 LOCK
+    永不可裁字段，交付物会凭空少一整句、还没有任何提示。
+
+    现在的做法：先把拉丁词摘掉，摘完**一个汉字都不剩**才丢整行
+    （真正纯英文的行仍然被丢掉，这正是当初要的效果）。
+    """
+    out: list[str] = []
+    for line in lines:
+        if not _LATIN_RUN.search(line):
+            out.append(line)
+            continue
+        cleaned = _LATIN_WITH_SEP.sub("", line)
+        # 收拾落单的顿号：「禁止出现bgm、logo、水印」→「禁止出现水印」
+        cleaned = _re.sub(r"[、，]\s*(?=[、，。；]|$)", "", cleaned)
+        cleaned = _re.sub(r"[（(]\s*[)）]", "", cleaned)
+        cleaned = _re.sub(r"\s{2,}", " ", cleaned).strip()
+        # 英文占了大半、剩下的汉字又只有个标签（「画质：」「参数：」）→ 仍按英文行丢掉，
+        # 这是当初"整行删"想达到的效果；而中文句子里的一个品牌名远达不到这个比例。
+        removed = sum(len(run) for run in _LATIN_RUN.findall(line))
+        if len(line) and removed / len(line) > 0.5 and len(_CJK_CHAR.findall(cleaned)) < 4:
+            continue
+        if _CJK_CHAR.search(cleaned):
+            out.append(cleaned)
+        # 一个汉字都不剩 → 整行本来就是英文，丢掉
+    return out
 
 
 def _render_audio(ir: Mapping[str, Any], handles: HandleResolver) -> list[str]:
@@ -596,37 +889,64 @@ def _render_audio(ir: Mapping[str, Any], handles: HandleResolver) -> list[str]:
 # --------------------------------------------------------------------------
 # 创作区渲染
 # --------------------------------------------------------------------------
-def _render_beats(ir: Mapping[str, Any], *, max_body_chars: int = 0) -> list[str]:
-    """按 shot_mode 决定写法：一镜到底用时间戳分段，多镜头用「镜头N：」。
+def _render_beats(ir: Mapping[str, Any]) -> list[str]:
+    """逐镜头写一行，**前缀一律是「镜头N：」**。
 
-    ``max_body_chars`` > 0 时截断单条节拍的动作描述 —— 模型对场景的散文式
-    描写常常上百字，而节拍需要的是**动作**。截断点选在句子边界，不切半句。
+    **不再写秒数**（用户 2026-09-29 第三轮）：「0-9.102秒画面：」这种前缀
+    既难读、又是生成平台用不上的信息 —— 时长在生成平台是独立控件。
+    一镜到底的片子本来只有一镜，写「镜头1：」也不会歧义；
+    而【对白与口型】本来就是按「镜头1（人物1）」写的，前面也得对得上。
+
+    **机位角度与运镜都写进这一行**（用户 2026-09-29 要求）：
+    例如「中全景，平视机位拍摄，固定机位拍摄，室内健身房…」。
+    用户明确要求把机位从「关键一致性」里搬到这里 —— 逐镜头才说得清，
+    而且放在一起读起来就是一个完整的分镜句。
+
+    **场景只在变化时写**（用户 2026-09-29 第五轮）：
+    「场景始终为[图N]的…环境，保持同一位置和光线氛围」已经在【关键一致性】里钉过，
+    节拍行再把模型逐镜头写的 location 抄一遍就是纯冗余 ——
+    实测一条四镜头的片子里，「同一室内演播厅舞台，背景弧形大屏与灯带不变」
+    被抄了 3 遍。现在**同一个地方只说一次**（第一次带上细节），
+    真的换场景时才再写一句。
+
+    **不做节拍截断**。曾经这里有个 ``max_body_chars`` 参数把 ``blocking``
+    截到 60 字，但它不在框架 §9.2 的压缩清单里，而且只截一个字段、
+    承诺与交付物不一致。实测节拍各字段本来就只有 13~33 字，没有可裁的散文。
     """
-    shot_mode = str(ir.get("meta", {}).get("shot_mode") or "one_take")
     lines: list[str] = []
-    cursor = 0.0
-    for beat in ir.get("creative", {}).get("C2_beats", []):
-        shot_id = beat.get("shot_id") or 0
-        duration = float(beat.get("duration_sec") or 0)
+    # **没有台词的片子不写「语气」**（实测踩过）：语气是"话是怎么说的"，
+    # 参考视频里没人说话时写「语气专注」是在描述不存在的声音。
+    # 情绪本身不丢 —— 它就在同一行的 ``expression``（「表情专注」）里。
+    has_dialogue = any(
+        str((beat.get("dialogue") or {}).get("line") or "").strip()
+        for beat in ir.get("creative", {}).get("C2_beats", [])
+    )
+    spoken_locations: list[str] = []
+    for index, beat in enumerate(ir.get("creative", {}).get("C2_beats", []), start=1):
         framing = str(beat.get("framing") or "").strip()
+        angle = str(beat.get("camera_angle") or "").strip()
         camera = str(beat.get("camera") or "").strip()
-        location = str(beat.get("location") or "").strip()
+        location = _new_location(str(beat.get("location") or "").strip(), spoken_locations)
         blocking = str(beat.get("blocking") or "").strip()
         expression = str(beat.get("expression") or "").strip()
         emotion = str(beat.get("emotion") or "").strip()
+        prefix = f"镜头{beat.get('shot_id') or index}："
 
-        if max_body_chars:
-            blocking = _truncate_at_sentence(blocking, max_body_chars)
-
-        head = "".join(p for p in (framing, camera) if p and p != UNKNOWN)
+        # 「中全景，平视机位拍摄，固定机位拍摄」
+        head_parts = [p for p in (framing,) if p and p != UNKNOWN]
+        if angle and angle != UNKNOWN:
+            head_parts.append(f"{angle}机位拍摄")
+        if camera and camera != UNKNOWN:
+            # 模型的 ``camera`` 字段**不一定**是运镜：实测出现过「过肩」
+            # （那是机位/构图）。放进运镜槽位会读成"镜头在过肩移动"，
+            # 所以按词判定槽位，而不是一律当运镜写。
+            if _is_movement(camera):
+                head_parts.append(_motion_phrase(camera))
+            elif "构图" not in camera:
+                head_parts.append(f"{camera}构图")
+        head = "，".join(head_parts)
         if location:
             head = f"{head}，{location}" if head else location
-        if shot_mode == "one_take":
-            start, end = cursor, cursor + duration
-            cursor = end
-            prefix = f"{_fmt_sec(start)}-{_fmt_sec(end)}秒画面："
-        else:
-            prefix = f"镜头{shot_id}："
 
         # 技术头 / 动作 / 表情 / 情绪，逐段成句，避免标点拼接出错。
         # UNKNOWN 不写进正文：把"没反推出来"写成 unknown 是往提示词里灌噪声。
@@ -634,7 +954,7 @@ def _render_beats(ir: Mapping[str, Any], *, max_body_chars: int = 0) -> list[str
             _text_or_empty(head), _text_or_empty(blocking),
             _text_or_empty(expression),
         ]
-        if _text_or_empty(emotion):
+        if has_dialogue and _text_or_empty(emotion):
             segments.append(f"语气{_text_or_empty(emotion)}")
         body = "，".join(s.rstrip("。，") for s in segments if s)
         if not body:
@@ -644,24 +964,95 @@ def _render_beats(ir: Mapping[str, Any], *, max_body_chars: int = 0) -> list[str
     return lines
 
 
-def _truncate_at_sentence(text: str, limit: int) -> str:
-    """在句子边界截断，绝不留半句话。"""
-    if len(text) <= limit:
-        return text
-    head = text[:limit]
-    for mark in "。；！？，、":
-        index = head.rfind(mark)
-        if index > limit * 0.5:
-            return head[: index + 1].rstrip("，、")
-    return head
-
-
 def _text_or_empty(value: str) -> str:
     return "" if value in UNKNOWN or value is None else str(value).strip()
 
 
+# --------------------------------------------------------------------------
+# 场景去重：同一个地方只说一次
+# --------------------------------------------------------------------------
+_SAME_SCENE_MARKERS = ("同一", "同上", "同前", "如前", "不变", "保持一致")
+"""模型亲口说"还是那个地方"的措辞。"""
+
+_SAME_SCENE_OVERLAP = 4
+"""两段场景描述共享多长的**连续**文字就算同一个地方。
+
+实测依据：两条多人片子里「同一场景」都表现为共享 5 字地点短语 ——
+「室内演播厅」「工作室前台」；而真正换了地方的描述共享不到这么长的片段
+（中文里 4 字以上的连续重合基本就是地名/场所名，不是巧合）。
+"""
+
+
+def _new_location(candidate: str, written: list[str]) -> str:
+    """这一镜的场景值不值得再写一遍。
+
+    场景已经在【关键一致性】里钉死（「场景始终为[图N]的…环境」），
+    所以这里只回答一个问题：**换地方了吗**。没换就返回空串，
+    调用方就不会把它拼进节拍行。
+    """
+    if not candidate:
+        return ""
+    for seen in written:
+        if _looks_like_same_scene(candidate, seen):
+            return ""
+    written.append(candidate)
+    return candidate
+
+
+def _looks_like_same_scene(candidate: str, established: str) -> bool:
+    if any(marker in candidate for marker in _SAME_SCENE_MARKERS):
+        return True
+    return _longest_common_run(candidate, established) >= _SAME_SCENE_OVERLAP
+
+
+def _longest_common_run(a: str, b: str) -> int:
+    """最长公共**连续**子串的长度（短句够用）。"""
+    if not a or not b:
+        return 0
+    best = 0
+    previous = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        current = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                current[j] = previous[j - 1] + 1
+                best = max(best, current[j])
+        previous = current
+    return best
+
+
 def _fmt_sec(value: float) -> str:
     return f"{value:g}"
+
+
+_MOTION_PHRASES = {
+    "固定": "固定机位拍摄",
+    "推近": "推近拍摄",
+    "拉远": "拉远拍摄",
+    "跟拍": "跟拍",
+    "横摇": "横摇拍摄",
+    "手持": "手持拍摄",
+    "斯坦尼康跟拍": "跟拍",
+    "固定机位全程不变": "固定机位拍摄",
+    "稳定推近": "推近拍摄",
+    "手持自拍": "手持拍摄",
+}
+
+
+def _motion_phrase(value: str) -> str:
+    """运镜 → 句中说法（「固定」→「固定机位拍摄」）。未知值原样返回。"""
+    return _MOTION_PHRASES.get(value, value)
+
+
+_MOVEMENT_HINTS = (
+    "固定", "推", "拉", "摇", "移", "跟", "手持", "升降", "环绕", "变焦", "晃动", "稳定",
+)
+"""词里带这些字才当运镜。实测踩过：模型把「过肩」写进 ``camera`` 字段，
+而它是机位/构图，不是镜头怎么动。"""
+
+
+def _is_movement(value: str) -> bool:
+    return any(hint in value for hint in _MOVEMENT_HINTS)
 
 
 def _render_dialogue(ir: Mapping[str, Any]) -> list[str]:
@@ -682,7 +1073,70 @@ def _render_dialogue(ir: Mapping[str, Any]) -> list[str]:
     if not lines:
         # 没有台词就不要输出口型段落 —— 空段落会被误读成"要求保持口型同步"
         return []
-    return [DIALOGUE_PREFIX] + lines + [LIPSYNC_SENTENCE]
+    # 口型要求那句（「中文普通话，语速中等，吐字清晰」）用户 2026-09-29 明确去掉：
+    # 它是一条无对象的泛化要求，对生成没有约束力。LIPSYNC_SENTENCE 保留 ——
+    # 那句是"口型必须与台词同步"，属于有效约束。
+    return lines + [LIPSYNC_SENTENCE]
+
+
+_PROCESS_NOISE = (
+    "取证", "非字幕", "分屏", "画中画", "属场景内元素", "确认为", "经查",
+    "完整单画面", "不是字幕", "经核对",
+)
+"""**我们自己的分析口径**，不是画面内容 —— 不写进交付物。
+
+用户 2026-10-08：「目前你给出的信息太复杂，看不懂 …… 目前你给出的括号里的内容就不要了。」
+实测那条扩展段里就混着「经取证为完整单画面，屏幕属场景内元素，非字幕、分屏或画中画」——
+那是我们判断"要不要单开一段"的理由，对生成模型毫无用处，用户也看不懂。
+它仍然留在报告里（`reviews`/`evidence`）可追溯，只是不进提示词。
+"""
+
+_CONFIRM_NOTE = "这一处请人工确认后修改。"
+
+
+def _render_extensions(ir: Mapping[str, Any]) -> list[str]:
+    """渲染扩展段：**大白话描述画面里读到了什么**。
+
+    用户 2026-10-08 的要求（原来那版太像工程报告）：
+
+    - 直接写**AI 读到的画面信息**：有什么字、怎么排版、有什么东西；
+    - **没读到的要说清原因**，并给出能读到的部分；
+    - 结尾**提示人工确认修改**；
+    - **括号里的依据不要了**（那是我给自己的解释）；
+    - **"以下画面文字不要生成"这句前缀也不要**（用户 2026-10-08 追加）。
+      去掉它是安全的：【禁止项】里本来就有「全程不生成任何字幕文字，100%透明字幕。」
+      与「禁止出现…批注文字或设计说明元素。」—— D0 是全局约束，
+      在扩展段里再写一遍只是重复。带「」的文字本身也看得出是画面上的字。
+    """
+    lines: list[str] = []
+    for item in ir.get("creative", {}).get("C3_extensions", []) or []:
+        if not isinstance(item, Mapping):
+            continue
+        title = str(item.get("title") or "").strip()
+        body: list[str] = []
+        for raw_line in item.get("lines") or []:
+            text = str(raw_line).strip()
+            if not text or any(word in text for word in _PROCESS_NOISE):
+                continue
+            # `_drop_english` 收一组行、返回一组行（摘掉英文片段）；这里处理单行
+            cleaned = _drop_english([text])
+            if cleaned:
+                body.append(cleaned[0])
+        unreadable = str(item.get("unreadable") or "").strip()
+        if not title or not (body or unreadable):
+            continue
+        lines.append(f"［扩展］{title}")
+        lines.extend(body)
+        if unreadable:
+            # 没看清的部分：说清**是什么**、**为什么没看清**，然后请人工确认
+            lines.append(f"{_drop_english([unreadable])[0]}。{_CONFIRM_NOTE}")
+        elif any(_QUOTED_TEXT.search(line) for line in body):
+            # 读到了画面文字：这类地方最容易写错一个字，提醒人工核对
+            lines.append(_CONFIRM_NOTE)
+    return lines
+
+
+_QUOTED_TEXT = _re.compile(r"[\"“”「」『』][^\"“”「」『』]{2,}[\"“”「」『』]")
 
 
 def _render_forbidden(
@@ -698,15 +1152,93 @@ def _render_forbidden(
     ]
 
 
+PLACEHOLDER_RE = _re.compile(r"【([^】]+)】")
+"""``【素材位名】`` 的唯一定义。
+
+**不设长度上限**（实测踩过）：这里原来写 ``{1,24}``、而闸门 G1 的残留检测写
+``{1,40}``，两个数字不一样。素材名超过 24 字时解析不了（正文里留着 ``【…】``），
+超过 40 字时连 G1 也检测不到 —— 正文带着裸占位符交付，G1 还报「残留=0」。
+红线 6 要求残留必须为 0，判据就不该有"够长就看不见"的死角。
+"""
+
+
 def _replace_placeholders(text: str, handles: HandleResolver) -> str:
     """解析期把 ``【xxx】`` 换成 ``[图N]``（框架 §2.1 两步转换的第二步）。"""
     def swap(match: "_re.Match[str]") -> str:
         return handles.token_for(match.group(1), fallback=match.group(0))
 
-    return _re.sub(r"【([^】]{1,24})】", swap, text)
+    return PLACEHOLDER_RE.sub(swap, text)
 
 
 _DECLARED_TOKEN_RE = _re.compile(r"\[(?:图|视频|音频)\d+\]")
+
+
+# --------------------------------------------------------------------------
+# 人称统一：正文里一律用「人物N」
+# --------------------------------------------------------------------------
+_BRACE_SEGMENT_RE = _re.compile(r"(〔[^〕]*〕)")
+"""``〔灰色运动外套女子 · 画面左侧〕`` 这种"人物N 是谁"的定义段。"""
+
+
+def person_label_map(ir: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    """``人物名写法 → 人物N``，**长写法排在前面**。
+
+    用户 2026-09-29（第三轮）要求：「关键一致性里的人物1灰色运动外套女子、
+    人物2米色开衫女子，已经给人物1和人物2标定了特征，所以下面的提示词
+    直接用人物1和人物2标定就行了」。
+
+    也就是说：``人物1〔灰色运动外套女子〕`` 已经把特征标定过了，
+    后面就不必把「灰色运动外套女子」这种长描述再抄 5 遍 ——
+    台词、音色、动作、镜头节拍统一用 ``人物1``。
+
+    返回元组而不是 dict：调用方要的正是"长的先替换"这个顺序
+    （短写法是长写法的子串时，先换长的那一次才不会被切碎）。
+    """
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for index, person in enumerate(ir.get("locked", {}).get("B2_person", []), start=1):
+        label = f"人物{index}"
+        for key in ("display_name", "name"):
+            name = str(person.get(key) or "").strip()
+            # 单字写法（"女"）做替换会把别的词一起吃进去，只收 2 字以上
+            if len(name) < 2 or name == label or name in seen:
+                continue
+            seen.add(name)
+            pairs.append((name, label))
+    pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+    return tuple(pairs)
+
+
+def unify_person_labels(
+    lines: Sequence[str],
+    aliases: Sequence[tuple[str, str]],
+) -> list[str]:
+    """把行里的人名换成 ``人物N``，但 **〔…〕 里的外观描述原样保留**。
+
+    〔…〕 就是"人物N 是谁"的定义，连它一起换掉的话 ``人物1`` 就没有指代对象了。
+
+    换完还要**收掉「人物N（人物N）」这种重复**：模型（或自检回路）自己就会写
+    「人物2（深灰色上衣女子）微笑」，括号里的名字被同一轮替换成 ``人物2`` 之后
+    就变成了「人物2（人物2）微笑」—— 实测在生产链路里出现过。
+    """
+    if not aliases:
+        return list(lines)
+    out: list[str] = []
+    for line in lines:
+        parts = _BRACE_SEGMENT_RE.split(line)
+        for position, part in enumerate(parts):
+            if part.startswith("〔"):
+                continue
+            for name, label in aliases:
+                if name in part:
+                    part = part.replace(name, label)
+            parts[position] = part
+        out.append(_DUP_LABEL_RE.sub(r"\1", "".join(parts)))
+    return out
+
+
+_DUP_LABEL_RE = _re.compile(r"(人物(\d+))\s*[（(]\s*人物\2\s*[）)]")
+"""同号重复：``人物2（人物2）`` → ``人物2``。**号不同不合并**（那是有信息量的）。"""
 
 
 def declared_tokens(text: str) -> set[str]:
@@ -864,11 +1396,19 @@ def _ceil_div(value: float, divisor: float) -> int:
 # 丢弃顺序即优先级：从先丢到后丢。
 # **永不可裁**（框架 §9.2 明文）：B3 站位/视线/遮挡、B6 音色参考、
 # C3 台词原文、D0 通用底线、D7 对白锁定。它们不在下表里，也没有任何代码路径能删它们。
+#
+# 这里**曾经多出第 ④ 步「节拍里的散文式场景描写，截断至 60 字」** ——
+# 它不在框架 §9.2 的五条清单里，是实现时自己加的；而且它只截 `blocking`
+# 一个字段，`location`/`expression` 都没截，于是承诺与交付物不一致
+# （报告写着"已截断至 60 字"，实际节拍行 79~124 字）。已删除。
+#
+# 删除前实测过该步有没有价值：节拍各字段的实际长度是
+# location 17~33 字 / blocking 15~32 字 / expression 13~24 字，
+# **本来就没有可裁的散文**，这一步省 0 字。留着只会污染压缩报告。
 COMPRESSION_STEPS: tuple[str, ...] = (
     "quality_preset_text",   # ① B5 次要画质描述：保留预设名，丢弃展开句
     "person_longtail",       # ② B2 人物长尾：保留「参考[图N]锁定五官脸型」
     "forbidden_low_freq",    # ③ D 区低频条目（D5/D6）
-    "beat_body_truncate",    # ④ C2 节拍里的散文式场景描写
 )
 
 
@@ -879,7 +1419,6 @@ class _CompressionPlan:
     quality_preset_text: bool = True
     person_longtail: bool = True
     forbidden_low_freq: bool = True
-    beat_body_limit: int = 0
     entries: list[CompressionEntry] = field(default_factory=list)
 
 
@@ -977,17 +1516,6 @@ def _apply_step(
             saved_chars=0,
         )
 
-    if step == "beat_body_truncate" and plan.beat_body_limit == 0:
-        if not ir.get("creative", {}).get("C2_beats"):
-            return None
-        plan.beat_body_limit = 60
-        return CompressionEntry(
-            section="镜头节拍",
-            what="节拍里散文式的场景描写（截断至 60 字，句子边界处断开）",
-            reason="节拍需要的是动作，不是环境散文；截断不影响表演约束",
-            saved_chars=0,
-        )
-
     return None
 
 
@@ -1031,7 +1559,7 @@ def assemble(
 
     plan = compress(ir, lib, budget=limit) if compress_to_budget else _CompressionPlan(
         quality_preset_text=True, person_longtail=True,
-        forbidden_low_freq=True, beat_body_limit=0,
+        forbidden_low_freq=True,
     )
 
     include_header = with_param_header
@@ -1060,6 +1588,9 @@ def _build_document(
     over: list[str] = []
 
     # ① 参数声明（★ 按交付模式决定是否写）
+    #    用户 2026-09-29 明确去掉这一行（「9:16 竖屏，15.07 秒，720p，生成同步音频」）：
+    #    比例/时长/分辨率在生成平台上是**独立控件**，写进提示词正文是冗余。
+    #    是否写由 ``delivery.include_param_header`` 决定（反推默认置 False）。
     if with_param_header:
         meta = ir.get("meta", {})
         doc.param_header = PARAM_HEADER_TEMPLATE.format(
@@ -1070,31 +1601,42 @@ def _build_document(
 
     # ③~⑨ 关键一致性
     locked_lines: list[str] = []
+    locked_hints: list[str] = []
     locked_lines.extend(_render_scene(ir, handles))
-    locked_lines.extend(_render_person(ir, handles, library))
+    person_lines, person_hints = _render_person(ir, handles, library)
+    locked_lines.extend(person_lines)
+    # 群体句紧跟在人物句后面：它说的就是"主体之外的其他人"
+    locked_lines.extend(_render_ensemble(ir))
+    locked_hints.extend(person_hints)
+    # 眨眼节拍与皮肤质感是**无条件固定项**（用户 2026-09-29 指定）：
+    # 它们是最容易被模型做错的默认项（眨眼频率不自然、过度磨皮），
+    # 所以不管反推有没有人物条目，交付物里都必须出现这一句。
+    locked_lines.extend(_render_universal_person_phrases(ir, library))
     locked_lines.extend(_render_blocking(ir))
     locked_lines.extend(_render_camera(ir))
     locked_lines.extend(_render_quality(ir, library,
                                         include_preset_text=plan.quality_preset_text))
-    locked_lines.extend(_render_audio(ir, handles))
+    # 音色**单独成段**（SEC_AUDIO），但素材声明要一起算 —— 见下面 declared。
+    audio_lines = _render_audio(ir, handles)
     if not plan.person_longtail:
         locked_lines = [PERSON_LONGTAIL_RE.sub("。", line) for line in locked_lines]
-    if not plan.quality_preset_text:
-        preset = str(ir.get("locked", {}).get("B5_quality", {}).get("preset") or "")
-        if preset:
-            locked_lines.append(f"画质档位：{preset}。")
+    # 画质档位行不再追加（_render_quality 已返回空）—— 见它的注释
     if locked_lines:
         doc.sections.append(PromptSection(
-            title=fw.SEC_LOCKED, lines=locked_lines, sources=["locked"],
+            title=fw.SEC_LOCKED, lines=_drop_english(locked_lines), sources=["locked"],
+            hints=locked_hints,
         ))
 
-    # ② 参考素材清单 —— 只列在正文里真正声明了用途的素材
-    declared = declared_tokens("\n".join(locked_lines))
-    ref_lines = handles.table_lines(declared)
-    if ref_lines:
-        doc.sections.insert(0, PromptSection(
-            title=fw.SEC_REFS, lines=ref_lines, sources=["references"],
-        ))
+    # ② 【参考素材】清单段**已按用户要求删除**（2026-09-29，第三轮）。
+    #    原来这里插一段「[图1] 人物1多视图 / [音频1] 人物1音频…」。
+    #    删掉的理由：素材的**用途**本来就在正文里逐句声明
+    #    （「…形象参考[图1]，用于…」「…音色参考[音频1]」），
+    #    清单只是把句柄和名字再抄一遍，对生成没有约束力。
+    #    正文句柄不受影响 —— 句柄由 HandleResolver 统一编号，与这段无关。
+    #
+    #    仍然算一遍 declared：它是"素材有没有在正文里被声明用途"的体检口径，
+    #    下面的 warning 与闸门 G12 都读它（音色段也要算进来：音频句柄是在那里声明的）。
+    declared = declared_tokens("\n".join(locked_lines + audio_lines))
     missing_roles = [t for t in handles.all_tokens if t not in declared]
 
     # 剧情
@@ -1105,7 +1647,7 @@ def _build_document(
         ))
 
     # 镜头节拍
-    beats = _render_beats(ir, max_body_chars=plan.beat_body_limit)
+    beats = _render_beats(ir)
     if beats:
         doc.sections.append(PromptSection(
             title=fw.SEC_BEATS, lines=beats, sources=["creative.C2_beats"],
@@ -1119,6 +1661,31 @@ def _build_document(
             sources=["creative.C2_beats[].dialogue"],
         ))
 
+    # 音色参考（永不可裁）—— 紧跟台词，用户才能一眼看出"谁说话、用谁的声音"
+    # （audio_lines 已在上面的素材声明处渲染过，这里直接复用，不重复渲染）
+    if audio_lines:
+        doc.sections.append(PromptSection(
+            title=fw.SEC_AUDIO, lines=audio_lines, sources=["locked.B6_audio"],
+        ))
+
+    # 动作与物理（正面约束动作不变形）
+    action_lines = _render_action_physics(ir, handles, library)
+    if action_lines:
+        doc.sections.append(PromptSection(
+            title=fw.SEC_ACTION, lines=action_lines,
+            sources=["locked.B2_person", "creative.C2_beats[].blocking"],
+        ))
+
+    # 扩展段：**框架外信息**的落脚点（屏上文案、分屏布局、变装点…）。
+    # 放在【动作与物理】之后、【禁止项】之前：既不打乱用户确认过的段落顺序，
+    # 也不让"禁止项"这个收尾段被挤到中间。
+    extension_lines = _render_extensions(ir)
+    if extension_lines:
+        doc.sections.append(PromptSection(
+            title=fw.SEC_EXTENSIONS, lines=extension_lines,
+            sources=["creative.C3_extensions"],
+        ))
+
     # ⑩ 禁止项
     forbidden = _render_forbidden(
         ir,
@@ -1128,6 +1695,14 @@ def _build_document(
         doc.sections.append(PromptSection(
             title=fw.SEC_FORBIDDEN, lines=forbidden, sources=["forbidden"],
         ))
+
+    # 人称统一：`人物1〔灰色运动外套女子〕` 已经把特征标定过了，
+    # 后面的正文一律用「人物1/人物2」（用户 2026-09-29 第三轮要求）。
+    # **只换 lines，不换 hints** —— hints 是给用户看的"这行可以换成什么"，
+    # 里面的素材名恰恰要让用户看清楚，换成人物N 反而看不懂了。
+    aliases = person_label_map(ir)
+    for section in doc.sections:
+        section.lines = unify_person_labels(section.lines, aliases)
 
     doc.strategy, split_issues = _split_summary(ir, library)
     doc.plan = _plans_of(ir, library)

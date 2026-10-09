@@ -5,8 +5,9 @@
 规范要求这一层用光流算运镜、用人体框占比算景别、用检测框算站位。
 本模块的策略是：
 
-1. **能确定性算出来的，认真算** —— 逐帧亮度序列判定运镜；
-   接入 YOLO 后，人体框高度占比算景别、框中心算站位、去重计数算人数；
+1. **能确定性算出来的，认真算** —— 人体框高度占比算景别、框中心算站位、
+   去重计数算人数；运镜的正路（光流）在 ``optical_flow.py``，
+   本模块的亮度序列只是**装不了 opencv 时的退路**；
 2. **算不了的，返回 unknown 并如实登记缺失** —— 绝不编一个数字冒充 CV 结果，
    那会让下游误以为有交叉校验（PRD 讲的"假的交叉验证"就是这么来的）；
 3. **能力运行时可探测** —— ``detect_capabilities()`` 报告本机有什么、缺什么，
@@ -36,7 +37,13 @@ class CvCapabilities:
     """本机 CV 能力盘点。**运行时可探测**，不硬编码。"""
 
     motion_from_luma: bool = True
-    """运镜：逐帧亮度序列能区分"稳定"与"持续变化"。"""
+    """运镜（退路）：逐帧亮度序列能区分"稳定"与"持续变化"。
+
+    这个退路**分不清镜头动与被摄体动**，只能保守地给 fixed/unknown，
+    所以它不算运镜维度真的被 CV 覆盖了。
+    """
+    motion_optical_flow: bool = False
+    """运镜（正路）：光流能分开"镜头在动"与"画面里的人在动"。需 opencv。"""
     framing: bool = False
     """景别：需要人体框高度占比。"""
     blocking: bool = False
@@ -49,6 +56,8 @@ class CvCapabilities:
     @property
     def missing(self) -> tuple[str, ...]:
         gaps: list[str] = []
+        if not self.motion_optical_flow:
+            gaps.append("运镜（缺光流，仅亮度退路，分不清镜头动与被摄体动）")
         if not self.framing:
             gaps.append("景别（需人体框占比）")
         if not self.blocking:
@@ -60,6 +69,7 @@ class CvCapabilities:
     def to_dict(self) -> dict[str, object]:
         return {
             "motion_from_luma": self.motion_from_luma,
+            "motion_optical_flow": self.motion_optical_flow,
             "framing": self.framing,
             "blocking": self.blocking,
             "people_count": self.people_count,
@@ -71,17 +81,26 @@ class CvCapabilities:
 def detect_capabilities() -> CvCapabilities:
     """探测本机可用的 CV 能力。
 
-    人体检测是**可选增强**：装了 ultralytics 就打开景别/站位/计数，
-    没装就退回"模型单独判断"。两条路都必须能跑通。
+    人体检测与光流都是**可选增强**：装了就用，没装就退回退路，
+    并且 ``missing`` 会如实报出来（``false`` 和"悄悄降级"是两回事）。
     """
     name = _probe_person_detector()
     return CvCapabilities(
         motion_from_luma=True,
+        motion_optical_flow=_probe_optical_flow(),
         framing=bool(name),
         blocking=bool(name),
         people_count=bool(name),
         person_detector=name,
     )
+
+
+def _probe_optical_flow() -> bool:
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _probe_person_detector() -> str:
@@ -103,6 +122,11 @@ BACKGROUND_PERSON_HEIGHT = 0.25
 
 菜市场、教室这类场景背景里全是路人。它们不该进"人物清单"
 （会给每个路人建多视图、浪费参考图配额），但要参与站位判断。
+
+**这个阈值分不开"路人"与"远景真人"**：`IP演播厅带练-丹` 里远机位的
+主要人物框高只有 0.23，会被当成背景。用 `scripts/verify_person_boxes.py`
+（看该区域的帧间运动）验证过那几个框**确实在动**，是真人 —— 所以
+远景镜头下这个小尺寸人物会被漏掉，是当前人体检测的**已知边界**。
 """
 
 
@@ -130,12 +154,8 @@ class PersonBox:
 
     @property
     def side(self) -> str:
-        """按中心 x 判定左/中/右。三分法，不做模糊地带。"""
-        if self.center_x < 0.4:
-            return "left"
-        if self.center_x > 0.6:
-            return "right"
-        return "center"
+        """按中心 x 判定左/中/右。判据与 ``side_of`` 共用一处，不重复定义。"""
+        return side_of(self.center_x)
 
     def to_dict(self) -> dict[str, float | str]:
         return {
@@ -202,26 +222,108 @@ class YoloPersonDetector:
         return boxes
 
 
+def composition_side(
+    boxes: Sequence[PersonBox],
+) -> tuple[str, float, int]:
+    """画面**构图**偏向哪一侧。返回 ``(偏侧, 人物 x 跨度中点, 前景人数)``。
+
+    **为什么不能取"最主要那个人"的左右**：双人镜头里两个人分别在 x=0.30 与
+    0.69，取最靠左的那个会判成 ``left`` —— 可人工标注认为这种"一左一右"
+    就是构图居中。所以取最左与最右的连线中点：一左一右 → 中点回到 0.5 附近。
+
+    前景人数按 ``BACKGROUND_PERSON_HEIGHT`` 过滤（只比"这是个人"更严一点），
+    这样既能滤掉背景路人，又不会把双人镜头里稍矮的那个当路人丢掉 ——
+    实测用"相对最高者的比例"过滤会误伤（0.84 与 0.50 的两个人本来是居中，
+    滤掉一个就变偏左了）。
+    """
+    foreground = [b for b in boxes if b.height_ratio >= BACKGROUND_PERSON_HEIGHT]
+    if not foreground:
+        return "", 0.0, 0
+    left = min(b.center_x for b in foreground)
+    right = max(b.center_x for b in foreground)
+    midpoint = (left + right) / 2.0
+    return side_of(midpoint), midpoint, len(foreground)
+
+
+def side_of(x_ratio: float) -> str:
+    """画面横向位置 → 左/中/右。中间带取 ±``SIDE_CENTER_BAND``。"""
+    if x_ratio < 0.5 - SIDE_CENTER_BAND:
+        return "left"
+    if x_ratio > 0.5 + SIDE_CENTER_BAND:
+        return "right"
+    return "center"
+
+
+SIDE_CENTER_BAND = 0.10
+"""判定「居中」的容差带宽度（即 0.40~0.60 算中间）。
+
+取自实测：单人居中镜头的框中心落在 0.50~0.54，双人镜头跨度中点在 0.42~0.51；
+明确偏侧的镜头在 0.16~0.36。这条带把两者分开，两侧都留有余量。
+"""
+
+# ----------------------------------------------------------------------
+# 景别分档阈值：人体框高度占画面的比例
+# ----------------------------------------------------------------------
+# 全部来自 16 个已标注镜头的穷举搜索（scripts/fit_framing_bands.py），
+# 切点放在**相邻标注档位之间的空档**里，而不是贴着样本切。
+# 标注样本量小，这些数字是当前最佳估计而非常量 —— 标注多了要重算。
+FRAMING_MEDIUM_WIDE = 0.52
+"""全景 / 中全景 分界。
+
+标注"全景"最大 0.57、"中景"最小 0.74 —— 切点取 0.52 是为了让
+0.57 那条落进中全景（它离"中景"的 0.74 更近），同时保住 0.47 以下的全景。
+"""
+FRAMING_MEDIUM = 0.66
+"""中全景 / 中景 分界。放在 0.57~0.74 那段**完全没有样本**的空档中间。"""
+FRAMING_MEDIUM_CLOSE = 0.88
+"""中景 / 中近景 分界。标注在这附近自相矛盾（0.87 同时被标成中景与近景），
+所以这一小段必然有损耗。"""
+FRAMING_CLOSE = 0.90
+"""中近景 / 近景 分界。
+
+取 0.90 而不是更高：实测"近景"的最小样本是 0.92，而 0.87 被标注者自己
+标成了两档。中近景因此只有 0.88~0.90 这一段 —— 窄，但那是标注数据的
+真实分辨率决定的，不是刻意压窄。"""
+FRAMING_FACE = 1.05
+"""近景 / 脸部特写 分界。人体框高度超过画面高度即视为只剩脸部特写。
+
+**这一档在标注里没有任何样本**（实测最大 0.92），属于按常识外推，
+不是量测结论。
+"""
+
+
 def framing_from_person(box: PersonBox) -> FramingEstimate:
     """人体框 → 景别。
 
     用**高度占比**而不是面积占比：竖屏 9:16 下人体是细长的，
     面积占比会被宽度稀释，而高度占比直接对应"人物占画面多大"。
-    实测：菜市场采访那条主人物高度占 0.92，正好是近景；背景路人只占 0.09。
+
+    **分档阈值来自人工标注的实测，不是拍的**（`scripts/fit_framing_bands.py`
+    在 16 个已标注镜头上穷举切点）：
+
+        标注"全景"的样本  高占比 0.32~0.57
+        标注"中景"的样本  高占比 0.74~0.87
+        标注"近景"的样本  高占比 0.87~0.92
+
+    全景与中景之间有一大段**空的**（0.57~0.74），切点放这段中间最稳；
+    中景与近景的标注本身就有重叠（0.87 同时被两位镜头标成两档），
+    切点只能放在这团重叠里，所以这两档天生分不干净。
+
+    **样本量只有 16 个，别把这里的数字当成定理。**标注多了要回来重算。
     """
     ratio = box.height_ratio
     confidence = compute_confidence(
         ConfidenceBasis.CV, consistency="single", evidence="timecode_and_frame"
     )
-    if ratio >= 1.05:
+    if ratio >= FRAMING_FACE:
         kind = "脸部特写"
-    elif ratio >= 0.75:
+    elif ratio >= FRAMING_CLOSE:
         kind = "近景"
-    elif ratio >= 0.55:
+    elif ratio >= FRAMING_MEDIUM_CLOSE:
         kind = "中近景"
-    elif ratio >= 0.35:
+    elif ratio >= FRAMING_MEDIUM:
         kind = "中景"
-    elif ratio >= 0.18:
+    elif ratio >= FRAMING_MEDIUM_WIDE:
         kind = "中全景"
     else:
         kind = "全景"
@@ -304,6 +406,11 @@ def analyze_motion(
     shot: ShotBoundary,
 ) -> MotionEstimate:
     """用镜头区间内的逐帧亮度序列判断运镜。
+
+    .. deprecated:: 光流已可用
+       这是**退路**，不是正路。装不了 opencv 时才用它。
+       正路是 ``optical_flow.OpticalFlowMotionAnalyzer`` —— 它能分开
+       "镜头在动"与"画面里的人在动"，而亮度序列做不到（见下）。
 
     **只在有把握时才给结论**，其余返回 ``unknown``：
 

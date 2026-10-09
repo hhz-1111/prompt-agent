@@ -70,6 +70,23 @@ export interface PromptSection {
   lines: string[];
   text: string;
   sources: string[];
+  hints: string[];
+  /** 给用户看的操作提示（如「↳ 可替换：[图1] = 王姐多视图」）。
+   *  **不进正文** —— 后端已经把它们与 lines 分开，导出时也不会带上。 */
+}
+
+export interface ForbiddenGroup {
+  label: string;
+  default_on: boolean;
+  note: string;
+  items: string[];
+}
+
+export interface ForbiddenGroupState {
+  groups: string[];
+  enforced: string[];
+  unknown: string[];
+  item_count: number;
 }
 
 export interface SegmentPlan {
@@ -98,13 +115,114 @@ export interface PromptDocument {
   text: string;
 }
 
+export interface ReviewItem {
+  kind: "gate" | "degradation" | "conflict" | "confidence";
+  level: "block" | "warn" | "review";
+  label: string;
+  detail: string;
+  suggestion: string;
+}
+
+/** 本次反推里"需要你知道/确认"的东西。
+ *
+ *  以前置信度、降级说明、CV↔模型冲突、闸门判定**一个出口都没有** ——
+ *  结果页只有一个文本框，只能靠肉眼抓错。 */
+export interface ReviewSummary {
+  count: number;
+  items: ReviewItem[];
+  truncated: number;
+}
+
 export interface AssembleResponse {
   document: PromptDocument;
   gates: GateReport;
+  review: ReviewSummary;
+  /** Agent 交给人裁决的选择题（最多 2 条）。点选后答案**直接写进提示词**。 */
+  questions: AgentQuestion[];
+  /** 用户意见改写的记账（最近若干轮）：刷新页面后仍能看到改过什么。 */
+  revisions: RevisionRecord[];
+  /** 还有没有可以撤销的改写（后端持有上一版 IR 快照）。 */
+  can_undo: boolean;
   compression: CompressionEntry[];
   split_plan: SegmentPlan[];
   positions: { counts: Record<PositionColor, number>; positions: Position[] };
   apply_targets: Record<string, string[]>;
+}
+
+/** Agent 提出的选择题。`options` 里的值就是能直接写进字段的值。 */
+export interface AgentQuestion {
+  id: string;
+  path: string;
+  text: string;
+  options: string[];
+  reason: string;
+}
+
+/** 用户意见改写：一处已生效的改动（给人看的原句 → 新句）。 */
+export interface RevisionChange {
+  path: string;
+  label: string;
+  before: string;
+  after: string;
+  reason: string;
+}
+
+/** 一条**做不到**的意见，以及为什么。必须显示出来 —— 不能让用户以为改好了。 */
+export interface RevisionRefusal {
+  instruction: string;
+  reason: string;
+}
+
+export interface RevisionNote {
+  path: string;
+  action: string;
+  reason: string;
+  applied: boolean;
+  detail: string;
+}
+
+/** 一轮改写里实际发生的模型调用（用途/型号/耗时/token）。 */
+export interface ModelCall {
+  purpose: string;
+  model: string;
+  seconds: number;
+  ok: boolean;
+  detail: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  reasoning_tokens: number;
+}
+
+/** 一轮改写的账：说了什么、改了哪几处、哪条没做到、调了什么模型。 */
+export interface RevisionRecord {
+  id: string;
+  instruction: string;
+  note: string;
+  model: string;
+  created_at: number;
+  seconds: number;
+  changes: RevisionChange[];
+  notes: RevisionNote[];
+  rejected: RevisionNote[];
+  refusals: RevisionRefusal[];
+  verdict_before: string;
+  verdict_after: string;
+  ok: boolean;
+  /** 这一轮到底调了哪些模型。用户要求"只让 DeepSeek 改、不要再送 MiMo 自检"，
+   *  这份账就是证据：正常恰好一条「按意见改写 · deepseek-flash」。 */
+  model_calls: ModelCall[];
+}
+
+export interface ReviseResponse {
+  ok: boolean;
+  record: RevisionRecord;
+  changes: RevisionChange[];
+  refusals: RevisionRefusal[];
+  rejected: RevisionNote[];
+  notes: RevisionNote[];
+  verdict_before: string;
+  verdict_after: string;
+  can_undo: boolean;
 }
 
 export interface ProjectSummary {
@@ -171,7 +289,18 @@ export interface HealthInfo {
   framework_version: string;
   phrase_lib_version: string;
   capabilities: {
-    llm: { configured: boolean; base_url: string; vision_model: string; text_model: string; asr_model: string };
+    llm: {
+      configured: boolean;
+      base_url: string;
+      vision_model: string;
+      text_model: string;
+      asr_model: string;
+      /** 下面几项是改写（PRD F8.4）用的：端点可换，界面上要如实显示是谁改的。 */
+      review_model?: string;
+      revise_model?: string;
+      revise_base_url?: string;
+      revise_configured?: boolean;
+    };
     media: { ffmpeg: string; ffprobe: string };
   };
   cv: { missing: string[]; to_dict?: unknown } & Record<string, unknown>;
@@ -304,8 +433,12 @@ export const api = {
     });
   },
 
-  startInfer: (id: string) =>
-    request<{ status: string }>(`/api/projects/${id}/infer`, { method: "POST" }),
+  /** ``review=false`` = 快速反推：跳过"交付前自检"（实测那一段要几分钟）。 */
+  startInfer: (id: string, review?: boolean) =>
+    request<{ status: string }>(
+      `/api/projects/${id}/infer${review === undefined ? "" : `?review=${review ? 1 : 0}`}`,
+      { method: "POST" },
+    ),
 
   inferStatus: (id: string) =>
     request<{
@@ -353,6 +486,41 @@ export const api = {
     }),
 
   assemble: (id: string) => request<AssembleResponse>(`/api/projects/${id}/assemble`),
+
+  /**
+   * 按用户的一句修改意见改写提示词（PRD F8.4）。
+   *
+   * 同步接口：后端改完才返回（实测 30~90 秒，个别情况更久），
+   * 所以界面上要显示"已等多少秒"，别让用户以为卡死了。
+   */
+  revise: (id: string, instruction: string) =>
+    request<ReviseResponse>(`/api/projects/${id}/revise`, {
+      method: "POST",
+      body: JSON.stringify({ instruction }),
+    }),
+
+  /** 撤销最近一轮改写：后端把上一份 IR 放回去。 */
+  undoRevision: (id: string) =>
+    request<{ ok: boolean; can_undo: boolean }>(`/api/projects/${id}/revise/undo`, {
+      method: "POST",
+    }),
+
+  /** 回答 Agent 的选择题：答案会写进 IR，之后再调 assemble 就能看到更新后的正文。 */
+  answerQuestion: (id: string, questionId: string, choice: string) =>
+    request<{ path: string; value: string }>(`/api/projects/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify({ id: questionId, choice }),
+    }),
+
+  /** 固定提示词表格页：按勾选重建禁止项清单（D0/D7 由后端强制保留）。 */
+  setForbiddenGroups: (id: string, groups: string[]) =>
+    request<ForbiddenGroupState>(`/api/projects/${id}/forbidden-groups`, {
+      method: "PUT",
+      body: JSON.stringify({ groups }),
+    }),
+
+  phraseLibrary: () =>
+    request<{ forbidden_groups: Record<string, ForbiddenGroup> }>("/api/phrases"),
 
   exportUrl: (id: string, form: "plain" | "markdown" | "json") =>
     `/api/projects/${id}/export?form=${form}`,

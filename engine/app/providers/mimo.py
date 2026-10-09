@@ -14,10 +14,12 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import mimetypes
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -41,17 +43,105 @@ JSON_SYSTEM_SUFFIX = (
 )
 
 
+def _schema_hint(schema: Mapping[str, Any]) -> str:
+    """端点不支持 ``json_schema`` 时，把 schema 写进提示词。
+
+    实测（2026-10-08）：DeepSeek 官方端点对 ``json_schema`` 直接 400
+    （``This response_format type is unavailable now``），只支持 ``json_object``。
+    所以走"schema 写进系统提示词 + json_object"这条路 ——
+    与 MiMo 那条路产出同样的 dict，上层 Provider 不用分叉。
+    """
+    return "\nJSON Schema：\n" + json.dumps(dict(schema), ensure_ascii=False)
+
+
 class MimoError(RuntimeError):
     """模型调用失败。上层据此降级，不吞错。"""
 
 
-class MimoClient:
-    """低层聊天补全客户端。上层 Provider 组合它，业务不直接用。"""
+# ----------------------------------------------------------------------
+# 每次模型调用的计时（用户 2026-10-07：自检"卡很久"，得先看清时间花在哪）
+# ----------------------------------------------------------------------
+_recorder = threading.local()
+"""**按线程**记账：反推跑在自己的线程里，多个人同时反推不能互相串账。"""
 
-    def __init__(self, settings: Settings, *, model_id: str | None = None) -> None:
+
+def record_call(
+    purpose: str,
+    model: str,
+    seconds: float,
+    *,
+    ok: bool,
+    detail: str = "",
+    usage: Mapping[str, Any] | None = None,
+) -> None:
+    """记一次调用：用途、型号、耗时、成败，**以及 token 用量**。
+
+    为什么要把 token 也记上（用户 2026-10-07 问"换模型是不是变贵了"）：
+    换模型提速的代价可能正是"烧更多 token"—— 实测同一个自检任务，
+    ``mimo-v2.6-pro-ultraspeed`` 用了 21152 输出 token（推理 20616），
+    ``mimo-v2.6-flash`` 用了 12792（推理 12163），**多 1.65 倍**。
+    没有 token 账，这件事只能靠猜（而我当时确实没量）。
+    """
+    records = getattr(_recorder, "records", None)
+    if records is None:
+        records = _recorder.records = []
+    payload = usage or {}
+    details = payload.get("completion_tokens_details") or {}
+    records.append({
+        "purpose": purpose or "未标注",
+        "model": model,
+        "seconds": round(seconds, 1),
+        "ok": ok,
+        "detail": detail[:120],
+        "prompt_tokens": int(payload.get("prompt_tokens") or 0),
+        "completion_tokens": int(payload.get("completion_tokens") or 0),
+        "reasoning_tokens": int(details.get("reasoning_tokens") or 0),
+    })
+
+
+def take_calls() -> list[dict[str, Any]]:
+    """取走本线程到目前为止的调用记录（取完清空）。"""
+    records = getattr(_recorder, "records", None) or []
+    _recorder.records = []
+    return list(records)
+
+
+class MimoClient:
+    """低层聊天补全客户端。上层 Provider 组合它，业务不直接用。
+
+    **不只是 MiMo**：``base_url`` / ``api_key`` 可以按实例覆盖，
+    所以同一个类既能连小米 MiMo，也能连 DeepSeek 官方 ——
+    用户 2026-10-08 要求的"所有 key 都要可换端点，.env 填了就自动切"就落在这里。
+    ``json_schema`` 也是实例级开关：实测 DeepSeek 官方端点
+    **不接受** ``response_format={"type":"json_schema"}``（400
+    `This response_format type is unavailable now`），只接受 ``json_object``，
+    于是必须能退回"把 schema 写进提示词 + json_object"这条路。
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        model_id: str | None = None,
+        base_url: str = "",
+        api_key: str = "",
+        json_schema: bool = True,
+    ) -> None:
         self.settings = settings
         self.model_id = model_id or settings.model_text
+        self.base_url = str(base_url or "").strip()
+        self.api_key = str(api_key or "").strip()
+        self.json_schema = bool(json_schema)
         self._opener = urllib.request.build_opener()
+
+    @property
+    def endpoint_base(self) -> str:
+        """实际请求的端点：实例覆盖优先，否则用 MiMo 的配置。"""
+        return (self.base_url or self.settings.mimo_base_url).rstrip("/")
+
+    @property
+    def token(self) -> str:
+        return self.api_key or self.settings.mimo_api_key
 
     # ------------------------------------------------------------------
     # 公开能力
@@ -64,41 +154,72 @@ class MimoClient:
         schema: Mapping[str, Any],
         images: Sequence[str] = (),
         temperature: float = 0.2,
+        timeout_sec: float | None = None,
+        retries: int | None = None,
+        purpose: str = "",
     ) -> Mapping[str, Any]:
-        """结构化输出。失败会做**一次**修复重试，再失败就抛错。"""
+        """结构化输出。失败会做**一次**修复重试，再失败就抛错。
+
+        ``timeout_sec`` / ``retries`` 可覆盖（见 ``_post``）：推理型长调用
+        （自检-重写）要收紧，否则一次调用最坏能拖到 9 分半。
+        """
         messages = [
             {"role": "system", "content": system + JSON_SYSTEM_SUFFIX},
             {"role": "user", "content": self._user_content(user, images)},
         ]
-        payload: dict[str, Any] = {
-            "model": self.model_id,
-            "messages": messages,
-            "temperature": temperature,
-            "max_completion_tokens": 8192,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "result",
-                    "strict": True,
-                    "schema": dict(schema),
+        if self.json_schema:
+            payload: dict[str, Any] = {
+                "model": self.model_id,
+                "messages": messages,
+                "temperature": temperature,
+                "max_completion_tokens": 8192,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "result",
+                        "strict": True,
+                        "schema": dict(schema),
+                    },
                 },
-            },
-        }
-        raw = self._post("/chat/completions", payload)
+            }
+        else:
+            # 端点不支持 json_schema（实测 DeepSeek 官方 400）：把 schema
+            # **写进系统提示词**，再用它支持的 json_object 兜住格式。
+            payload = {
+                "model": self.model_id,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system + JSON_SYSTEM_SUFFIX + _schema_hint(schema),
+                    },
+                    {"role": "user", "content": self._user_content(user, images)},
+                ],
+                "temperature": temperature,
+                "max_completion_tokens": 8192,
+                "response_format": {"type": "json_object"},
+            }
+        raw = self._post(
+            "/chat/completions", payload,
+            timeout_sec=timeout_sec, retries=retries, purpose=purpose,
+        )
         text = _message_text(raw)
         parsed = _try_parse(text)
         if parsed is not None:
             return parsed
 
         # 一次修复重试：把坏输出回灌，让模型只修 JSON
-        repair_messages = messages + [
+        repair_messages = list(payload["messages"]) + [
             {"role": "assistant", "content": text[:4000]},
             {"role": "user", "content": "上面的输出不是合法 JSON。请只重新输出合法 JSON，不要任何其他文字。"},
         ]
         repair_payload = dict(payload)
         repair_payload["messages"] = repair_messages
         repair_payload.pop("response_format", None)
-        raw2 = self._post("/chat/completions", repair_payload)
+        raw2 = self._post(
+            "/chat/completions", repair_payload,
+            timeout_sec=timeout_sec, retries=retries,
+            purpose=f"{purpose}·JSON修复" if purpose else "",
+        )
         parsed2 = _try_parse(_message_text(raw2))
         if parsed2 is None:
             raise MimoError(f"模型两次都未返回合法 JSON：{text[:200]!r}")
@@ -111,6 +232,9 @@ class MimoClient:
         user: str,
         images: Sequence[str] = (),
         temperature: float = 0.2,
+        timeout_sec: float | None = None,
+        retries: int | None = None,
+        purpose: str = "",
     ) -> str:
         payload = {
             "model": self.model_id,
@@ -121,7 +245,10 @@ class MimoClient:
             "temperature": temperature,
             "max_completion_tokens": 4096,
         }
-        return _message_text(self._post("/chat/completions", payload))
+        return _message_text(self._post(
+            "/chat/completions", payload,
+            timeout_sec=timeout_sec, retries=retries, purpose=purpose,
+        ))
 
     def transcribe(
         self,
@@ -187,41 +314,81 @@ class MimoClient:
         raw_body: bytes | None = None,
         content_type: str | None = None,
         model: str | None = None,
+        timeout_sec: float | None = None,
+        retries: int | None = None,
+        purpose: str = "",
     ) -> Mapping[str, Any]:
-        if not self.settings.has_llm:
-            raise MimoError("未配置 MIMO_API_KEY：请复制 .env.example 为 .env 并填入 Key")
+        """发一次请求。
 
-        url = self.settings.mimo_base_url.rstrip("/") + endpoint
+        ``timeout_sec`` / ``retries`` 可按调用覆盖（用户 2026-10-07 报"卡很久"）：
+        默认值下**单次调用最坏能拖到 9 分半**（180 秒 × 3 次尝试），
+        对"自检-重写"这种推理型长调用必须收紧，否则用户看到的就是"卡死"。
+
+        ``purpose`` 只用于**计时记账**（「自检」「取证」「视觉理解」…），
+        让用户下次能看到"这 9 分钟到底花在哪一次调用上"。
+        """
+        if not self.token:
+            raise MimoError(
+                "未配置模型 Key：请复制 .env.example 为 .env 并填入 MIMO_API_KEY"
+                "（或改写专用的 REVISE_API_KEY）"
+            )
+
+        url = self.endpoint_base + endpoint
         if raw_body is None:
             raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             content_type = "application/json; charset=utf-8"
 
         headers = {
-            "Authorization": f"Bearer {self.settings.mimo_api_key}",
+            "Authorization": f"Bearer {self.token}",
             "Content-Type": content_type or "application/json; charset=utf-8",
             "Accept": "application/json",
         }
 
+        budget = float(timeout_sec or self.settings.request_timeout_sec)
+        attempts = (self.settings.max_retries if retries is None else max(0, retries)) + 1
         last_error: Exception | None = None
-        for attempt in range(self.settings.max_retries + 1):
+        started = time.monotonic()
+        for attempt in range(attempts):
             request = urllib.request.Request(
                 url, data=raw_body, headers=headers, method="POST"
             )
             try:
-                with self._opener.open(
-                    request, timeout=self.settings.request_timeout_sec
-                ) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                with self._opener.open(request, timeout=budget) as response:
+                    parsed = json.loads(response.read().decode("utf-8"))
+                record_call(
+                    purpose, model or self.model_id, time.monotonic() - started,
+                    ok=True, usage=parsed.get("usage") if isinstance(parsed, Mapping) else None,
+                )
+                return parsed
             except urllib.error.HTTPError as exc:  # 4xx/5xx：带响应体便于定位
                 detail = exc.read().decode("utf-8", errors="replace")[:400]
                 last_error = MimoError(f"HTTP {exc.code} @{endpoint} {model or ''}: {detail}")
-                if exc.code in (429, 500, 502, 503, 504):
+                if exc.code in (429, 500, 502, 503, 504) and attempt + 1 < attempts:
                     time.sleep(1.5 * (attempt + 1))
                     continue
+                record_call(
+                    purpose, model or self.model_id, time.monotonic() - started,
+                    ok=False, detail=f"HTTP {exc.code}",
+                )
                 raise last_error from exc
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                json.JSONDecodeError,
+                # **连接中途断**：实测出现过 `IncompleteRead(59 bytes read)`
+                # （响应体读到一半断掉）。它不在 urllib 那两类里，原来会原样抛出去、
+                # 直接算这次调用失败 —— 现在按"调用失败"处理，行为一致可预期。
+                http.client.IncompleteRead,
+                ConnectionError,
+                OSError,
+            ) as exc:
                 last_error = MimoError(f"调用失败 @{endpoint}: {exc}")
-                time.sleep(1.0 * (attempt + 1))
+                if attempt + 1 < attempts:
+                    time.sleep(1.0 * (attempt + 1))
+        record_call(
+            purpose, model or self.model_id, time.monotonic() - started,
+            ok=False, detail=str(last_error)[:80],
+        )
         raise last_error or MimoError("调用失败，且没有捕获到具体错误")
 
 

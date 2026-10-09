@@ -37,6 +37,28 @@ class Project:
     stage: str = ""
     progress: float = 0.0
     error: str = ""
+    review_enabled: bool = True
+    """这次反推是否跑"自检-重写"（用户 2026-10-07：它一次调用就要 129 秒）。
+
+    按**项目**记住选择：关掉=快速反推（少几次模型调用），
+    代价是交付前没人回头看一遍，如实记在交付物里。
+    """
+
+    revisions: list[dict[str, Any]] = field(default_factory=list)
+    """用户意见改写的记账（PRD F8.4）。**每一轮一条**，落盘、可展示、可追溯。
+
+    为什么要落盘而不是只放在内存：改完之后用户要能回头看
+    "我当时说了什么、它动了哪几处、哪条它没做到" —— 第七轮踩过一次
+    （``InferenceReport.to_dict`` 漏字段导致记账静默消失），
+    所以这里的序列化**成对写**并有回归测试守着。
+    """
+
+    ir_history: list[dict[str, Any]] = field(default_factory=list)
+    """改写前的 IR 快照，**只为一键撤销**用（最近若干轮，由配置封顶）。
+
+    存整份 IR 而不是"反向 patch"：IR 只有几 KB，直接存最省心，
+    撤销就是"把上一份放回去"，没有反向应用的出错空间。
+    """
 
     def touch(self) -> None:
         self.updated_at = time.time()
@@ -54,6 +76,7 @@ class Project:
             "progress": self.progress,
             "error": self.error,
             "has_ir": bool(self.ir),
+            "review_enabled": self.review_enabled,
         }
 
 
@@ -175,6 +198,8 @@ class ProjectStore:
             "error": project.error,
             "ir": project.ir,
             "report": project.report,
+            "revisions": project.revisions,
+            "ir_history": project.ir_history,
         }
 
     @staticmethod
@@ -192,4 +217,9 @@ class ProjectStore:
             stage=str(raw.get("stage", "")),
             progress=float(raw.get("progress", 0)),
             error=str(raw.get("error", "")),
+            review_enabled=bool(raw.get("review_enabled", True)),
+            revisions=[dict(item) for item in (raw.get("revisions") or [])
+                       if isinstance(item, Mapping)],
+            ir_history=[dict(item) for item in (raw.get("ir_history") or [])
+                        if isinstance(item, Mapping)],
         )

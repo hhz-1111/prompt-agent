@@ -235,6 +235,18 @@ class TestPhraseEngine:
         assert "毛孔" in tpl.variant("full")
         assert "无过度磨皮" in tpl.variant("brief")
 
+    @pytest.mark.parametrize("key,fragment", [
+        # 逐字钉住 TEMPLATES §2.4 的三档原句。
+        # 曾经 build_phrases.py 是手打这两句的，漏了「隔」还多出空格，
+        # 于是引擎输出的眨眼句与历史成功提示词**逐字对不上** ——
+        # 而固定模块的全部价值就在于逐字。
+        ("3-4s", "人物每隔3-4秒自然快速眨眼一次（每次约0.1秒），融入说话节奏，眨眼频率自然。"),
+        ("5s", "人物每隔5秒自然快速眨眼一次（每次约0.1秒），融入对话节奏，眨眼频率自然。"),
+        ("3s", "人物每隔3秒自然快速眨眼一次（每次约0.1秒），融入动作节奏，眨眼频率自然。"),
+    ])
+    def test_blink_variants_are_verbatim_from_spec(self, lib, key, fragment):
+        assert lib.templates["T-BLINK"].variant(key) == fragment
+
     def test_template_render_fails_loudly_on_missing_slot(self, lib):
         with pytest.raises(ValueError, match="缺少槽位"):
             lib.templates["T-PERSON"].render(角色名="王姐")
@@ -322,23 +334,84 @@ class TestAssembler:
     def test_assembles_all_sections(self, lib):
         doc = assembler.assemble(_sample_ir(), lib)
         titles = [s.title for s in doc.sections]
+        # 样例是**菜市场对话**（人物只是抬手说话，没有身体动作）→ 没有【动作与物理】。
+        # 该段的出现条件见 test_content_kind.py：只有动作/体式/教学动作类才有。
         assert titles == [
-            fw.SEC_REFS, fw.SEC_LOCKED, fw.SEC_LOGLINE,
-            fw.SEC_BEATS, fw.SEC_DIALOGUE, fw.SEC_FORBIDDEN,
+            fw.SEC_LOCKED, fw.SEC_LOGLINE,
+            fw.SEC_BEATS, fw.SEC_DIALOGUE, fw.SEC_AUDIO,
+            fw.SEC_FORBIDDEN,
         ]
+
+    def test_person_names_are_replaced_by_labels(self, lib):
+        """用户 2026-09-29（第三轮）：人物N 的特征已经在〔〕里标定过，下文一律用人物N。
+
+        否则「灰色运动外套女子」这种长描述会在正文里被抄 5 遍
+        （人物句、镜头节拍、台词、音色、动作各一次）。
+        """
+        text = assembler.assemble(_sample_ir(), lib).full_text()
+        # 〔…〕 里保留"人物N 是谁"的定义，**不能**一起换掉
+        assert "人物1〔王姐〕" in text
+        assert "人物1形象参考[图1]" in text, "人物句本身要用标签"
+        # 其他段落也用标签，不再重复长名字
+        assert "王姐声音音色参考[音频1]" not in text
+        assert "人物1声音音色参考[音频1]" in text
+        assert "角色名" not in text  # 占位兜底断言：确保上面看的确实是渲染结果
+        assert "人物2" in text
+
+    def test_person_label_map_is_longest_first(self):
+        """短写法是长写法的子串时，先换长的那一次，否则会把长名切碎。"""
+        ir = {"locked": {"B2_person": [
+            {"name": "红色开衫女子"}, {"name": "开衫女子"},
+        ]}}
+        aliases = assembler.person_label_map(ir)
+        assert aliases[0][0] == "红色开衫女子"
+        assert assembler.unify_person_labels(
+            ["红色开衫女子走进来"], aliases
+        ) == ["人物1走进来"]
+
+    def test_person_label_map_ignores_single_char_names(self):
+        """单字写法做替换会把别的词一起吃掉，必须拒收。"""
+        ir = {"locked": {"B2_person": [{"name": "女"}]}}
+        assert assembler.person_label_map(ir) == ()
+
+    def test_action_physics_is_positive_constraint(self, lib):
+        """动作与物理是**正面**约束（要保住什么），与 D0.6 的禁止项互补。
+
+        **只对动作类写**（用户 2026-10-07）：样例本身是对话类，所以要显式标成
+        action 才该出现 —— 这同时也是"判据生效"的一个反证。
+        """
+        assert assembler.assemble(_sample_ir(), lib).section(fw.SEC_ACTION) is None
+
+        ir = _sample_ir()
+        ir["meta"]["content_kind"] = "action"
+        doc = assembler.assemble(ir, lib)
+        section = doc.section(fw.SEC_ACTION)
+        assert section is not None
+        text = "\n".join(section.lines)
+        assert "动作轨迹与幅度" in text
+        assert "不变形" in text
+        # 动作类还必须带 1:1 复刻句（用户原话）
+        assert "1:1复刻其中的肢体轨迹、身体角度、抬手弯腰幅度" in text
+        assert "不出现任何其他动作" in text
 
     def test_reference_handles_are_numbered_per_role(self, lib):
         """图片与音频各自独立编号 —— 不能混成一个序列。"""
-        doc = assembler.assemble(_sample_ir(), lib)
-        section = doc.section(fw.SEC_REFS)
-        assert section is not None
-        assert section.lines == [
-            "[图1] 王姐多视图",
-            "[图2] 李姐多视图",
-            "[图3] 菜市场场景图",
-            "[音频1] 王姐音频",
-            "[音频2] 李姐音频",
+        ir = _sample_ir()
+        handles = assembler.HandleResolver(ir)
+        assert handles.all_tokens == [
+            "[图1]", "[图2]", "[图3]", "[音频1]", "[音频2]",
         ]
+        # 句柄必须在正文里被用到（用户 2026-09-29 删掉了【参考素材】清单段，
+        # 所以句柄唯一的落点就是正文里的用途声明句）。
+        body = assembler.assemble(ir, lib).body_text
+        assert [t for t in handles.all_tokens if t in body] == handles.all_tokens
+
+    def test_no_reference_material_section(self, lib):
+        """用户 2026-09-29 明确要求：交付物里不要再出现【参考素材】这一段。"""
+        doc = assembler.assemble(_sample_ir(), lib)
+        assert fw.SEC_REFS not in [s.title for s in doc.sections]
+        assert "【参考素材】" not in doc.full_text()
+        assert "【参考素材】" not in doc.body_text
 
     def test_section_titles_are_not_part_of_body(self, lib):
         """段落标题写作【关键一致性】，不能因此被 G1 判成占位符残留。"""
@@ -396,12 +469,111 @@ class TestAssembler:
         doc = assembler.assemble(ir, lib)
         assert doc.section(fw.SEC_DIALOGUE) is None
 
-    def test_one_take_uses_timestamp_prefix(self, lib):
+    def test_duplicate_person_label_is_collapsed(self, lib):
+        """``人物2（人物2）`` 要收成 ``人物2``。
+
+        实测踩过（生产链路重推）：自检回路自己写「人物2（深灰色上衣女子）微笑」，
+        同一轮人称统一把括号里的名字也换成 ``人物2`` → 交付物出现
+        「人物2（人物2）微笑」。号不同**不合并**（那是有信息量的）。
+        """
+        lines = assembler.unify_person_labels(
+            ["人物2（深灰色上衣女子）微笑", "人物1（人物2）站在一起"],
+            [("深灰色上衣女子", "人物2")],
+        )
+        assert lines[0] == "人物2微笑", lines[0]
+        assert lines[1] == "人物1（人物2）站在一起", lines[1]
+
+    def test_camera_word_that_is_not_a_movement_goes_elsewhere(self, lib):
+        """模型的 ``camera`` 不一定是运镜：「过肩」是机位/构图，不是镜头怎么动。
+
+        实测踩过：节拍行渲染成「中景，平视机位拍摄，**过肩**，…」，
+        读起来像"镜头在过肩移动"。现在按词分槽位。
+        """
+        ir = _sample_ir()
+        ir["creative"]["C2_beats"][0]["camera"] = "过肩"
+        ir["creative"]["C2_beats"][1]["camera"] = "跟拍"
+        lines = assembler.assemble(ir, lib).section(fw.SEC_BEATS).lines
+        assert "过肩构图" in lines[0], lines[0]
+        assert "跟拍" in lines[1], lines[1]
+
+    def test_scene_is_written_once_per_place(self, lib):
+        """场景已在【关键一致性】钉过，节拍行不该逐镜头重复。
+
+        实测踩过：一条四镜头片子里「同一室内演播厅舞台，背景弧形大屏与灯带不变」
+        被抄了 3 遍；去掉重复后中文从 979 → 919 字。
+        """
         doc = assembler.assemble(_sample_ir(), lib)
         lines = doc.section(fw.SEC_BEATS).lines
-        assert lines[0].startswith("0-4秒画面：")
-        assert lines[1].startswith("4-8秒画面：")
-        assert lines[2].startswith("8-12秒画面：")
+        assert lines[0].count("菜市场摊位前") == 1, lines[0]
+        for line in lines[1:]:
+            assert "菜市场摊位前" not in line, f"同一个场景又写了一遍：{line}"
+
+    def test_new_scene_is_still_written(self, lib):
+        """**真的换地方**时必须写出来 —— 去重不能把新信息也去掉。"""
+        ir = _sample_ir()
+        ir["creative"]["C2_beats"][2]["location"] = "茶楼雅间靠窗座位"
+        lines = assembler.assemble(ir, lib).section(fw.SEC_BEATS).lines
+        assert "菜市场摊位前" in lines[0]
+        assert "茶楼雅间靠窗座位" in lines[2], lines[2]
+
+    def test_same_scene_detection_rules(self):
+        """判"同一个地方"的两条依据：模型明说 + 共享连续地点名。"""
+        same = assembler._looks_like_same_scene
+        assert same("同一室内演播厅舞台，背景弧形大屏与灯带不变", "室内演播厅，背景为带弧形大屏的舞台")
+        assert same("工作室前台接待台前，台面有平板电脑", "普拉提工作室前台大厅，浅色木地板")
+        # 换了地方：共享不到 4 字连续地点名
+        assert not same("茶楼雅间靠窗座位", "菜市场摊位前，浅色地砖")
+
+    def test_no_seconds_in_beat_prefix(self, lib):
+        """用户 2026-09-29（第三轮）：交付物里不要再出现「0-9.102秒画面：」这种前缀。
+
+        一镜到底也不再写时间戳 —— 时长在生成平台是独立控件，
+        而【对白与口型】本来就是按「镜头N（人物）」写的，前缀得对得上。
+        """
+        for mode in ("one_take", "multi_shot", "same_angle_segments"):
+            ir = _sample_ir()
+            ir["meta"]["shot_mode"] = mode
+            doc = assembler.assemble(ir, lib)
+            assert "秒画面" not in doc.full_text(), f"{mode} 仍写出了秒数"
+            lines = doc.section(fw.SEC_BEATS).lines
+            assert lines[0].startswith("镜头1："), lines[0]
+
+    def test_no_tone_word_for_a_silent_video(self, lib):
+        """没有台词的片子不写「语气X」。
+
+        语气是"话是怎么说的"。参考视频里没人说话时写「语气专注」，
+        是在描述不存在的声音（实测踩过一条纯静音的动作示范片）。
+        情绪本身不丢 —— 它就在同一行的 expression 里。
+        """
+        ir = _sample_ir()
+        for beat in ir["creative"]["C2_beats"]:
+            beat["dialogue"]["line"] = ""
+        lines = assembler.assemble(ir, lib).section(fw.SEC_BEATS).lines
+        assert lines, "节拍行不该为空"
+        assert not any("语气" in line for line in lines), lines
+
+    def test_english_is_stripped_not_the_whole_line(self, lib):
+        """带英文词的中文句子要**保留**，只摘掉英文片段。
+
+        实测踩过：判据原来是"整行含 ≥3 个连续拉丁字母就整行丢"，
+        于是「场景始终为[图3]的演播厅环境，背景有大屏PILATES标识，保持同一位置
+        和光线氛围」这句**整句消失** —— 而场景锚定是 LOCK 永不可裁字段。
+        """
+        keep = assembler._drop_english(
+            ["场景始终为[图3]的演播厅环境，背景有大屏PILATES标识，保持同一位置和光线氛围"]
+        )
+        assert keep == [
+            "场景始终为[图3]的演播厅环境，背景有大屏标识，保持同一位置和光线氛围"
+        ]
+        # 纯英文行仍然整行丢掉（当初要的就是这个效果）
+        assert assembler._drop_english(["画质：auto white balance slightly cool"]) == []
+        assert assembler._drop_english(["logo"]) == []
+        # 没有英文的行原样保留
+        assert assembler._drop_english(["100%透明字幕"]) == ["100%透明字幕"]
+
+    def test_tone_word_stays_when_someone_speaks(self, lib):
+        lines = assembler.assemble(_sample_ir(), lib).section(fw.SEC_BEATS).lines
+        assert any("语气" in line for line in lines), lines
 
     def test_multi_shot_uses_shot_prefix(self, lib):
         ir = _sample_ir()
@@ -447,8 +619,13 @@ class TestAssembler:
         assert any("S4" in i.suggestion for i in issues)
 
     def test_compression_is_never_silent(self, lib):
-        """压缩必须有记录、有理由，且绝不触碰永不可裁的内容。"""
-        entries = assembler.compress(_sample_ir(full_forbidden_library=True), lib).entries
+        """压缩必须有记录、有理由，且绝不触碰永不可裁的内容。
+
+        用**动作类**样例：它的段落最全（含【动作与物理】），压缩路径才走得完整。
+        """
+        ir = _sample_ir(full_forbidden_library=True)
+        ir["meta"]["content_kind"] = "action"
+        entries = assembler.compress(ir, lib).entries
         assert entries
         assert all(entry.reason for entry in entries)
         assert all(entry.saved_chars >= 0 for entry in entries)
@@ -459,6 +636,7 @@ class TestAssembler:
     def test_compression_actually_reduces_length(self, lib):
         """压缩不是建议，是真执行 —— 交付物必须真的变短。"""
         ir = _sample_ir(full_forbidden_library=True)
+        ir["meta"]["content_kind"] = "action"
         plain = assembler.assemble(ir, lib, compress_to_budget=False)
         squeezed = assembler.assemble(ir, lib, compress_to_budget=True)
         assert squeezed.char_count < plain.char_count
@@ -584,13 +762,13 @@ class TestGates:
         assert "王姐" in result.detail and "李姐" in result.detail
 
     def test_g7_warns_over_char_budget(self, lib):
-        """PRD 把 500 字定为「建议值」而非硬上限，处置是压缩+标注。
+        """字数预算是**建议值**而非硬上限，处置是压缩+标注。
 
-        实测 24 条真实爆款视频压到极限仍在 650~850 字 ——
-        因为永不可裁的部分（D0+D7、站位、音色、台词）本身就很长。
+        24 条真实爆款视频压到极限仍在 650~1200 字 ——
+        因为永不可裁的部分（D0+D7、站位、音色、台词）与节拍行本身就很长。
         所以这是告警，不是阻断。
         """
-        ir = _sample_ir(full_forbidden_library=True)
+        ir = _sample_ir(pad_beats_to=12)
         doc = assembler.assemble(ir, lib)
         result = gates.g7_char_budget(doc, ir, lib)
         assert result.status == gates.WARN
@@ -663,23 +841,70 @@ class TestGates:
         assert result.blocking
         assert "钩子" in result.detail
 
-    def test_g12_autofixes_undeclared_reference(self, lib):
+    def test_g14_ignores_dialogue_content(self, lib):
+        """台词是"提及"不是"主张"：里面出现降级短语不该判 BLOCK。
+
+        实测踩过：组装器包台词用的是 **ASCII 双引号**（`"…"`），
+        而 `strip_quoted` 只认「」“”『』，于是台词被当成正文主张扫，
+        G14 直接 block：「强约束被降级：1:1复刻 → 照着做就行」——
+        用户一句正常台词就让整条片子不可交付。
+        """
+        ir = _sample_ir()
+        ir["creative"]["C2_beats"][0]["dialogue"]["line"] = "你照着做就行"
+        doc = assembler.assemble(ir, lib)
+        assert '"你照着做就行"' in doc.full_text(), "台词应该被 ASCII 引号包着"
+        assert not gates.g14_constraint_strength(doc, lib).blocking
+
+    def test_g1_sees_long_placeholder_residue(self, lib):
+        """素材名很长时，【】残留不能被漏掉（解析与检测必须同一套正则）。
+
+        实测踩过：解析用 ``{1,24}``、残留检测用 ``{1,40}``，
+        28 字素材名两头都不匹配 → 正文带着裸【…】交付，G1 还报「残留=0」。
+        """
+        ir = _sample_ir()
+        long_name = "素" * 28
+        ir["references"][0]["slots"] = [long_name]
+        ir["locked"]["B2_person"][0]["multi_view_ref"] = long_name
+        doc = assembler.assemble(ir, lib)
+        assert f"【{long_name}】" not in doc.full_text(), "长素材名也要能解析成句柄"
+        assert gates.g1_placeholder_residue(doc, ir).status == gates.OK
+        # 真的残留时必须报出来
+        doc.sections[0].lines.append(f"人物形象参考【{long_name}】")
+        assert gates.g1_placeholder_residue(doc, ir).blocking
+
+    def test_g12_reports_undeclared_reference_honestly(self, lib):
+        """素材没在正文里声明用途时要报出来，但**不能说"已自动补"**。
+
+        实测踩过：原来恒返回 `autofixed=True / 已自动补默认声明 N 项`，
+        可 doc 与 ir 一个字节都没动 —— 报告在说谎，用户以为已经补好了。
+        """
         ir = _sample_ir()
         ir["references"].append({
             "slots": ["未声明素材"], "type": "multi_view", "placeholder": "【未声明素材】",
             "asset_id": "x", "seedance_role": "reference_image",
         })
-        result = gates.g12_ref_roles(assembler.assemble(ir, lib), ir)
-        assert result.autofixed
+        doc = assembler.assemble(ir, lib)
+        result = gates.g12_ref_roles(doc, ir)
+        assert result.status == gates.WARN
         assert "未声明素材" in result.detail
+        assert not result.autofixed, "它并没有改任何东西，不能声称已自动修复"
+        assert "交付物未被自动改写" in result.detail
         assert "人物形象参考" in result.suggestion
 
     def test_g13_warns_on_missing_dimensions(self, lib):
+        """空 IR 上真正缺的是景别/机位/站位这些**没有固定句**的维度。
+
+        **眨眼节拍不算缺**（实测踩过）：它的句子在正文里是**无条件固定项**，
+        没有人物条目时照样写着，而 IR 内容挂在 ``locked.B2_person[]`` 下 ——
+        只看 IR 就会报「缺：眨眼节拍 / 整条未反推到」，两句话都不成立。
+        """
         ir = fw.empty_ir()
         doc = assembler.assemble(ir, lib)
         result = gates.g13_mandatory_dimensions(doc, ir, lib)
         assert result.status == gates.WARN
-        assert "眨眼节拍" in result.detail
+        assert "站位" in result.detail and "景别" in result.detail
+        assert "眨眼节拍" not in result.detail
+        assert "眨眼" in doc.body_text, "正文里确实有这句，不该判缺失"
 
     def test_g13_audits_assembled_prompt_not_ir(self, lib):
         """IR 里 blink 存的是键名 "5s"，逐字表述是组装时才展开的。
@@ -703,7 +928,7 @@ class TestGates:
 
     def test_blocked_report_is_not_deliverable(self, lib):
         """红线 10：闸门未全绿时不许声称可交付。"""
-        ir = _sample_ir()
+        ir = _sample_ir(pad_beats_to=12)
         # 用确定性的阻断源：把强约束降级（G14），这是最常见也最致命的事故
         ir["creative"]["C2_beats"][0]["blocking"] = "动作参考一下原片"
         doc = assembler.assemble(ir, lib)
@@ -714,9 +939,15 @@ class TestGates:
         assert report.summary_lines()[-1] == "→ 阻断交付"
 
     def test_warning_only_report_stays_deliverable(self, lib):
-        """只有告警（字数超建议值、必写维度缺）时仍可交付，但要如实标注。"""
-        ir = _sample_ir()
+        """只有告警（字数超预算、必写维度缺）时仍可交付，但要如实标注。
+
+        刻意用**补齐节拍**的方式构造确定超预算的输入，而不是靠某个固定字数
+        刚好越线 —— 这样预算调高调低都不会把这条测试变成"偶然通过"
+        （预算已经从 500 调到 800 一次了）。
+        """
+        ir = _sample_ir(pad_beats_to=12)
         doc = assembler.assemble(ir, lib)
+        assert doc.over_budget > 0, "构造的输入本应超预算"
         report = gates.run_gates(ir, doc, lib)
         assert not report.blockers
         assert report.deliverable
@@ -732,14 +963,46 @@ class TestGates:
         assert lines[-1].startswith("→")
 
     def test_summary_reports_budget_overrun(self, lib):
-        """完整双人长句版本会撞上字数建议值 —— 如实报出，不粉饰。"""
-        ir = _sample_ir()
-        report = gates.run_gates(ir, assembler.assemble(ir, lib), lib)
+        """超预算时如实报出，不粉饰。"""
+        ir = _sample_ir(pad_beats_to=12)
+        doc = assembler.assemble(ir, lib)
+        report = gates.run_gates(ir, doc, lib)
         g7 = report.by_code("G7")
         assert g7 is not None
         assert g7.status == gates.WARN
         assert "超出" in g7.detail and "压掉" in g7.detail
         assert report.summary_lines()[-1].startswith("→")
+
+    def test_within_budget_reports_ok(self, lib):
+        """预算内的输入 G7 必须是 ok —— 否则"全绿"永远不可达。"""
+        ir = _sample_ir(minimal=True)
+        doc = assembler.assemble(ir, lib)
+        assert doc.over_budget == 0
+        assert gates.run_gates(ir, doc, lib).by_code("G7").status == gates.OK
+
+    def test_blink_and_skin_are_unconditional(self, lib):
+        """眨眼节拍与皮肤质感是**无条件固定项**（用户 2026-09-29 指定）。
+
+        它们是最容易被模型做错的默认项，所以不挂在人物条目下面 ——
+        反推不出人物时也必须出现。
+        """
+        ir = _sample_ir(minimal=True)
+        ir["locked"]["B2_person"] = []          # 故意让反推不出人物
+        text = assembler.assemble(ir, lib).full_text()
+        assert "眨眼" in text, "没有人物条目时眨眼节拍也必须写"
+        assert "毛孔" in text and "磨皮" in text, "皮肤质感句也必须写"
+
+    def test_blink_and_skin_not_duplicated_per_person(self, lib):
+        """两个人物的片子，这两句各出现一次，不是每人一遍。
+
+        按**行数**统计，不按子串出现次数 ——
+        「眨眼」在一句里自然出现两次（「快速眨眼一次」+「眨眼频率自然」）。
+        """
+        ir = _sample_ir()
+        assert len(ir["locked"]["B2_person"]) >= 2
+        lines = assembler.assemble(ir, lib).full_text().splitlines()
+        assert sum(1 for line in lines if "眨眼" in line) == 1
+        assert sum(1 for line in lines if "毛孔" in line) == 1
 
 
 class TestPersonRenameCascade:
@@ -826,13 +1089,16 @@ def _sample_ir(
     *,
     full_forbidden_library: bool = False,
     minimal: bool = False,
+    pad_beats_to: int = 0,
 ) -> dict:
     """一条结构完整的"菜市场双人对话"，对齐 PRD §5 的示例。
 
-    - 默认：合规产线的常见形态（禁止项取 D0.1 + D4 + D7），中文约 750 字 ——
-      **会触发 G7 字数阻断**，这正是 PRD 风险 4 描述的真实冲突，不该被藏起来。
-    - ``full_forbidden_library=True``：把整库禁止项都塞进去，用于复现"正文常超 1500 字"。
+    - 默认：合规产线的常见形态（禁止项取用户指定的默认组 D0 + D1 + D7）。
+    - ``full_forbidden_library=True``：把整库禁止项都塞进去。
     - ``minimal=True``：最小可交付形态，用于验证"闸门对合规输入不误报"。
+    - ``pad_beats_to=N``：把节拍补到 N 个（每个带台词与动作）。
+      **用来构造"确定超预算"的输入** —— 别再靠"某个固定字数刚好越线"，
+      因为预算值会调（500 → 800），靠字数越线的测试会随预算变化偶然通过或失败。
     """
     lib = ph.load_library()
     ir = fw.empty_ir(genre="dialogue", shot_mode="one_take")
@@ -906,13 +1172,22 @@ def _sample_ir(
     if full_forbidden_library:
         ir["forbidden"] = lib.forbidden_items()
     else:
-        # 合规产线的默认集合：D0 核心 + D4 泛化防补 + D7 对白锁定
-        ir["forbidden"] = [
-            item for item in lib.forbidden_items()
-            if item["id"].startswith("D7.")
-            or item["id"].startswith("D4.")
-            or item["id"] == "D0.1"
-        ]
+        # 合规产线的默认集合 = 用户指定的默认组（D0 + D1 + D7）
+        ir["forbidden"] = lib.forbidden_items()
+
+    if pad_beats_to > 0:
+        # 补齐节拍到指定数量，用来构造**确定超预算**的输入。
+        # 每节拍带台词 + 动作 + 表情，是真实长片的形态。
+        template = ir["creative"]["C2_beats"][-1]
+        while len(ir["creative"]["C2_beats"]) < pad_beats_to:
+            index = len(ir["creative"]["C2_beats"]) + 1
+            clone = json.loads(json.dumps(template, ensure_ascii=False))
+            clone["shot_id"] = index
+            clone["blocking"] = f"人物{index}号在摊位前抬手比划，身体转向画面左侧" * 2
+            clone["expression"] = "神情专注，目光平视前方"
+            clone["emotion"] = "专注"
+            clone["dialogue"]["line"] = f"这是第{index}句台词，用来把正文撑到超预算的长度"
+            ir["creative"]["C2_beats"].append(clone)
 
     if minimal:
         # 最小可交付形态：一个角色（有人物多视图 + 音色）、一个场景、无画质预设。
