@@ -74,24 +74,22 @@ cd web && npm install && npm run build && cd ..
 
 开发期可以前后端分离：`py scripts/run.py` + `cd web && npm run dev`（5173 端口，已配好代理）。
 
-### 部署到云服务器（Linux）
+### 在 Linux 上运行
 
-后端会**同时提供前端页面**，所以生产环境只需要暴露 **8000 一个端口**。
-用 Docker 一条命令即可跑起来：
+后端会**同时提供前端页面**（`web/dist` 构建产物），所以只需要暴露 **8000 一个端口**，
+不需要单独部署前端、也不需要配跨域。
 
 ```bash
+python -m venv .venv
+.venv/bin/pip install -e ".[app,shots]"
+cd web && npm ci && npm run build && cd ..
 cp .env.example .env          # 填入 MIMO_API_KEY
-docker compose up -d --build
-#   → 界面 http://<服务器IP>:8000
+.venv/bin/python scripts/run.py --host 0.0.0.0 --port 8000
 ```
 
-完整步骤（建私有仓库 → 推送 → 服务器拉取 → 启动 → 验证 → 排错）
-见 **[`DEPLOY.md`](DEPLOY.md)**，其中也包含不用 Docker 的裸机方案。
-
-> **Linux 上必须加 `--host 0.0.0.0`**，否则只有服务器自己能访问：
-> `.venv/bin/python scripts/run.py --host 0.0.0.0 --port 8000`
+> **必须加 `--host 0.0.0.0`**（`scripts/run.py` 默认只监听 `127.0.0.1`，外部访问不到）。
 >
-> **只能单进程**：反推队列是进程内实现，不要用 `--workers N` 或多副本。
+> **只能单进程**：反推队列是进程内实现，不要用 `--workers N` 或多副本，否则排队状态各进程不一致。
 
 ### 验证
 
@@ -110,6 +108,11 @@ docker compose up -d --build
 .venv\Scripts\python.exe scripts\dimension_regression.py export --sample   # 生成标注清单
 .venv\Scripts\python.exe scripts\dimension_regression.py score            # 算准确率
 ```
+
+> **注意**：上面带素材路径的命令（`--dir 测试素材`、维度回归、留出集评测）需要本机存在
+> 对应素材与标注数据。那些是内部评测数据，**不在本仓库里** —— 本仓库只包含实现功能的代码
+> 与运行必需的 `assets/phrases/phrases.json`。所以 `pytest` 可以直接跑，这些评测脚本需要你
+> 自备素材。
 
 `benchmark.py` 覆盖的是**不依赖人工标注**的指标；要测 PRD §6.1.5 那三条
 目标线必须有 ground truth，走 `dimension_regression.py`（标注流程见
